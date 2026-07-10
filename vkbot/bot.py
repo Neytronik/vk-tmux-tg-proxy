@@ -3471,17 +3471,26 @@ class VkTmuxBot:
                 continue
 
             if output == last_output:
-                # Детект простоя: тишина idle_secs → одно уведомление
+                # Детект простоя: тишина idle_secs → пинг + перенос якоря вниз,
+                # чтобы уведомление не «перебивало» терминал отдельным сообщением.
                 if not idle_notified and (time.time() - last_change) >= idle_secs:
                     idle_notified = True
-                    tail = "\n".join(output.strip().split("\n")[-20:])
                     mins = int(idle_secs / 60)
+                    banner = (f"💤 «{session}» тихо {mins} мин — вероятно, задача готова.\n"
+                              + "━" * 22 + "\n")
                     try:
-                        self.vk.send_message(
-                            peer_id,
-                            f"💤 Сессия «{session}» не меняется {mins} мин — вероятно, "
-                            f"задача завершена.\n\n📄 Последние строки:\n{tail[-3500:]}",
-                            keyboard=make_watch_keyboard())
+                        body = format_output(session, output)
+                        new_mid = self.vk.send_message(peer_id, banner + body,
+                                                       keyboard=make_watch_keyboard())
+                        if new_mid:
+                            with self._lock:
+                                if user_id in self.watching_sessions:
+                                    self.watching_sessions[user_id]["message_id"] = new_mid
+                            if message_id and message_id != new_mid:
+                                try:
+                                    self.vk.delete_message(peer_id, message_id)
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
                     print(f"💤 user={user_id} детект простоя: {session}")

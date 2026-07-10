@@ -1018,16 +1018,23 @@ class TgTmuxBot:
                                        keyboard=self._stream_kb(chat_id), html_mode=True)
                     fails = 0 if ok else fails + 1
                 else:
-                    # детект простоя
+                    # Детект простоя: тихо N минут → вероятно, задача готова.
+                    # Не плодим отдельное сообщение без кнопок (оно «перебивает»
+                    # терминал). Вместо этого шлём НОВОЕ сообщение (оно пингует)
+                    # с баннером + актуальным экраном + пультом и делаем его
+                    # новым якорем стрима, а старое удаляем — терминал один.
                     if not my["idle_notified"] and (time.time() - my["last_change"]) >= idle_secs:
                         my["idle_notified"] = True
-                        tail = "\n".join(clean_pane(raw).split("\n")[-20:])
                         mins = int(idle_secs / 60)
-                        self.api.send(
-                            chat_id,
-                            f"💤 «{session}» без изменений {mins} мин — вероятно, задача готова.\n"
-                            + pre_block(tail[-3500:]),
-                            html_mode=True)
+                        banner = f"💤 <b>«{session}»</b> тихо {mins} мин — вероятно, задача готова.\n"
+                        new_mid = self.api.send(chat_id, banner + text,
+                                                keyboard=self._stream_kb(chat_id), html_mode=True)
+                        if new_mid:
+                            old_mid = my["msg_id"]
+                            my["msg_id"] = new_mid
+                            my["stable"] = stable      # чтобы не переиздавать сразу
+                            if old_mid and old_mid != new_mid:
+                                self.api.delete(chat_id, old_mid)
             except Exception:
                 pass
         if self._stream_threads.get(chat_id) is threading.current_thread():
