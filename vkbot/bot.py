@@ -3480,17 +3480,14 @@ class VkTmuxBot:
                               + "━" * 22 + "\n")
                     try:
                         body = format_output(session, output)
+                        # Новое сообщение (пингует) с пультом — новый якорь.
+                        # Старое НЕ удаляем: вдруг вы им сейчас пользуетесь.
                         new_mid = self.vk.send_message(peer_id, banner + body,
                                                        keyboard=make_watch_keyboard())
                         if new_mid:
                             with self._lock:
                                 if user_id in self.watching_sessions:
                                     self.watching_sessions[user_id]["message_id"] = new_mid
-                            if message_id and message_id != new_mid:
-                                try:
-                                    self.vk.delete_message(peer_id, message_id)
-                                except Exception:
-                                    pass
                     except Exception:
                         pass
                     print(f"💤 user={user_id} детект простоя: {session}")
