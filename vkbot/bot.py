@@ -871,35 +871,20 @@ class VkTmuxBot:
         if self._create_tmux(name):
             self._set_session(user_id, name)
             self._save_state()
-            kb = make_main_keyboard(name)
 
             if command:
-                # Небольшая пауза чтобы shell инициализировался
                 time.sleep(0.4)
-                # Отправляем команду
-                if send_keys(name, command, press_enter=True):
-                    # Получаем вывод
-                    time.sleep(0.5)
-                    output = get_output(name, self.config["tmux"]["output_lines"])
-                    formatted = format_output(name, output)
-                    self.vk.send_message(
-                        peer_id,
-                        f"✅ Сессия «{name}» создана. Команда выполнена:\n\n{formatted}",
-                        keyboard=kb,
-                    )
-                else:
-                    self.vk.send_message(
-                        peer_id,
-                        f"✅ Сессия «{name}» создана, но команда не отправлена.",
-                        keyboard=kb,
-                    )
-            else:
-                self.vk.send_message(
-                    peer_id,
-                    f"✅ Сессия «{name}» создана и готова к работе!\nОтправьте команду: /s ls -la",
-                    keyboard=kb,
-                )
+                send_keys(name, command, press_enter=True)
+                time.sleep(0.6)
             print(f"✅ user={user_id} создал сессию: {name}" + (f" + команда: {command}" if command else ""))
+
+            # Сразу запускаем ЖИВОЙ watch (гибрид: TUI — живой экран, шелл — лента),
+            # чтобы вывод последующих команд появлялся сам, без ручного /watch.
+            if self._get_watch(user_id):
+                self._get_watch(user_id)["stop"] = True
+                self._del_watch(user_id)
+                self._watch_threads.pop(user_id, None)
+            self._cmd_watch(peer_id, user_id, "")
         else:
             self.vk.send_message(
                 peer_id,
