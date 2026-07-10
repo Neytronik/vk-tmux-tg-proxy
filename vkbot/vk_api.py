@@ -145,6 +145,22 @@ class VkApi:
             return result[0].get("message_id", 0) if isinstance(result[0], dict) else 0
         return 0
 
+    def get_audio_transcript(self, message_id):
+        """Вернуть (state, text) расшифровки голосового в сообщении.
+        state: 'done' | 'in_progress' | None. Использует встроенную
+        речь-в-текст ВКонтакте (никакого своего STT)."""
+        try:
+            res = self._call("messages.getById", {"message_ids": message_id})
+            items = res.get("items", []) if isinstance(res, dict) else []
+            for it in items:
+                for att in it.get("attachments", []):
+                    if att.get("type") == "audio_message":
+                        am = att.get("audio_message", {})
+                        return am.get("transcript_state"), am.get("transcript")
+        except Exception:
+            pass
+        return None, None
+
     def edit_message(self, peer_id, message_id, message, keyboard=None):
         """Редактировать сообщение (для watch mode)."""
         params = {
@@ -202,8 +218,16 @@ class VkApi:
 
     # ── Загрузка медиа ─────────────────────────────────────────
 
+    @staticmethod
+    def _guard_file(file_path):
+        """Убедиться, что файл существует и не пустой (иначе VK вернёт битый ответ)."""
+        import os
+        if not file_path or not os.path.exists(file_path) or os.path.getsize(file_path) < 16:
+            raise VkApiError(-1, "Пустой или отсутствующий файл")
+
     def upload_photo(self, peer_id, file_path):
         """Загрузить фото для сообщения. Возвращает строку вложения photo{owner}_{id}."""
+        self._guard_file(file_path)
         # 1. Сервер загрузки
         server = self._call("photos.getMessagesUploadServer", {"peer_id": peer_id})
         upload_url = server["upload_url"]
@@ -211,6 +235,8 @@ class VkApi:
         with open(file_path, "rb") as f:
             resp = requests.post(upload_url, files={"photo": f}, timeout=120)
         up = resp.json()
+        if not up.get("photo") or up.get("photo") == "[]":
+            raise VkApiError(-1, f"Сервер VK не принял фото: {str(up)[:150]}")
         # 3. Сохранение
         saved = self._call("photos.saveMessagesPhoto", {
             "photo": up["photo"], "server": up["server"], "hash": up["hash"],
@@ -221,12 +247,15 @@ class VkApi:
     def upload_doc(self, peer_id, file_path, title=None):
         """Загрузить документ/файл для сообщения. Возвращает doc{owner}_{id}."""
         import os
+        self._guard_file(file_path)
         title = title or os.path.basename(file_path)
         server = self._call("docs.getMessagesUploadServer", {"type": "doc", "peer_id": peer_id})
         upload_url = server["upload_url"]
         with open(file_path, "rb") as f:
             resp = requests.post(upload_url, files={"file": (title, f)}, timeout=300)
         up = resp.json()
+        if not up.get("file"):
+            raise VkApiError(-1, f"Сервер VK не принял файл: {str(up)[:150]}")
         saved = self._call("docs.save", {"file": up["file"], "title": title})
         # docs.save возвращает {type, doc:{owner_id,id}} или {doc:...}
         doc = saved.get("doc") if isinstance(saved, dict) else None
@@ -234,15 +263,37 @@ class VkApi:
             doc = saved[0].get("doc", saved[0])
         return f"doc{doc['owner_id']}_{doc['id']}"
 
+    def upload_video(self, peer_id, file_path, title=None):
+        """Загрузить видео (в т.ч. кружок) — VK покажет проигрываемым.
+        Возвращает строку вложения video{owner}_{id} или None при неудаче."""
+        import os
+        title = title or os.path.basename(file_path)
+        try:
+            # 1. Адрес для загрузки (group-токен: видео уходит в сообщество)
+            save = self._call("video.save", {"name": title[:128], "is_private": 1,
+                                             "wallpost": 0})
+            upload_url = save["upload_url"]
+            owner_id = save.get("owner_id")
+            vid = save.get("video_id")
+            # 2. Заливаем файл
+            with open(file_path, "rb") as f:
+                requests.post(upload_url, files={"video_file": (title, f)}, timeout=300)
+            return f"video{owner_id}_{vid}"
+        except Exception:
+            return None
+
     def upload_voice(self, peer_id, file_path):
         """Загрузить голосовое сообщение (VK покажет как voice). Возвращает doc{owner}_{id}.
         Файл должен быть .ogg (opus) — как отдаёт Telegram."""
+        self._guard_file(file_path)
         server = self._call("docs.getMessagesUploadServer",
                             {"type": "audio_message", "peer_id": peer_id})
         upload_url = server["upload_url"]
         with open(file_path, "rb") as f:
             resp = requests.post(upload_url, files={"file": ("voice.ogg", f)}, timeout=120)
         up = resp.json()
+        if not up.get("file"):
+            raise VkApiError(-1, f"Сервер VK не принял голосовое: {str(up)[:150]}")
         saved = self._call("docs.save", {"file": up["file"]})
         doc = saved.get("audio_message") or saved.get("doc") if isinstance(saved, dict) else None
         if not doc and isinstance(saved, list):

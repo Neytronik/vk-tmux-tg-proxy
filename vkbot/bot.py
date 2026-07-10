@@ -8,6 +8,7 @@ import re
 import json
 import sys
 import traceback
+from collections import deque
 
 from .config import load_config, save_config
 from .vk_api import (
@@ -89,6 +90,7 @@ class VkTmuxBot:
         self._tg_watch_threads = {}   # {user_id: Thread}
         self.tg_watch_cfg = {}        # {user_id: interval_sec} — сохранённые настройки
         self.tg_open_chat = {}        # {user_id: {chat_id, topic_id}} — открытый чат (персист)
+        self._tg_vk_sent = {}         # {user_id: deque(msg_id)} — что отправлено ИЗ VK (чтобы не дублировать)
         self._tg_lock = threading.Lock()  # защита избранного/мутов/настроек
         self._clients_lock = threading.Lock()  # защита создания TG-клиентов
         self._persist_lock = threading.Lock()  # защита записи JSON-файлов
@@ -2100,26 +2102,68 @@ class VkTmuxBot:
             ],
         ], one_time=False)
 
-    def _tg_proxy_incoming_async(self, user_id, peer_id, chat_id, msg_id, media, bubble, kb):
-        """Отправить бабблу с медиа в отдельном потоке (скачивание+загрузка не блокируют ленту)."""
+    def _maybe_transcribe(self, peer_id, mid, media):
+        """Для входящего голосового — дождаться встроенной расшифровки VK и
+        прислать её текстом отдельной строкой. Работает через механизм самого
+        ВКонтакте (messages.getById → audio_message.transcript)."""
+        if not mid or not media or media.get("kind") != "voice":
+            return
+        def _poll():
+            for _ in range(12):          # до ~36с ожидания
+                time.sleep(3.0)
+                state, text = self.vk.get_audio_transcript(mid)
+                if state == "done":
+                    if text and text.strip():
+                        self.vk.send_message(peer_id, f"📝 {text.strip()}")
+                    return
+        threading.Thread(target=_poll, daemon=True).start()
+
+    def _send_media_bubble(self, user_id, peer_id, chat_id, msg_id, media, bubble, kb=None):
+        """Отправить баббл с медиа в VK (+ авто-расшифровка голосового). В фоне."""
         def _work():
             tg = self._get_tg(user_id)
             att = None
             if tg:
                 att = self._tg_proxy_incoming_media(tg, user_id, peer_id, chat_id, msg_id, media)
             try:
-                self.vk.send_message(peer_id, bubble, keyboard=kb, attachment=att)
+                mid = self.vk.send_message(peer_id, bubble, keyboard=kb, attachment=att)
+                if att:
+                    self._maybe_transcribe(peer_id, mid, media)
             except Exception:
                 pass
         threading.Thread(target=_work, daemon=True).start()
 
-    def _tg_load_context_media(self, tg, user_id, peer_id, chat_id, msgs):
-        """При открытии чата — подгрузить реальные медиа из последних сообщений
-        (не только текстовые маркеры), чтобы контекст был полным. В фоне."""
-        # Берём последние сообщения с проксируемым медиа (не больше 6, чтобы не спамить)
-        media_msgs = [m for m in msgs
+    def _tg_proxy_incoming_async(self, user_id, peer_id, chat_id, msg_id, media, bubble, kb):
+        """Совместимый враппер: отправка медиа-баббла (+расшифровка голосового)."""
+        self._send_media_bubble(user_id, peer_id, chat_id, msg_id, media, bubble, kb)
+
+    def _mark_vk_sent(self, user_id, msg_id):
+        """Запомнить id сообщения, отправленного ИЗ VK — чтобы живая лента
+        не показала его повторно (исходящие с телефона она покажет, эти — нет)."""
+        if not msg_id:
+            return
+        dq = self._tg_vk_sent.get(user_id)
+        if dq is None:
+            dq = deque(maxlen=400)
+            self._tg_vk_sent[user_id] = dq
+        dq.append(msg_id)
+
+    def _is_vk_sent(self, user_id, msg_id):
+        dq = self._tg_vk_sent.get(user_id)
+        return bool(dq) and msg_id in dq
+
+    def _select_context_media(self, msgs):
+        """Какие сообщения из истории подгрузить реальными медиа при открытии чата.
+        Только свежий хвост (последние 4 сообщения, максимум 3 медиа) — чтобы не
+        выгребать старую историю."""
+        tail = (msgs or [])[-4:]
+        media_msgs = [m for m in tail
                       if m[5] and m[5].get("kind") in ("photo", "voice", "video", "video_note", "file")]
-        media_msgs = media_msgs[-6:]
+        return media_msgs[-3:]
+
+    def _tg_load_context_media(self, tg, user_id, peer_id, chat_id, media_msgs):
+        """Подгрузить выбранные медиа-сообщения отдельными бабблами (в фоне).
+        Пустые/битые загрузки молча пропускаются — без дублей-пустышек."""
         if not media_msgs:
             return
 
@@ -2129,7 +2173,8 @@ class VkTmuxBot:
                     att = self._tg_proxy_incoming_media(tg, user_id, peer_id, chat_id, msg_id, media)
                     if att:
                         bubble = self._tg_format_msg(sender, text, date, is_out, media)
-                        self.vk.send_message(peer_id, bubble, attachment=att)
+                        mid = self.vk.send_message(peer_id, bubble, attachment=att)
+                        self._maybe_transcribe(peer_id, mid, media)
                 except Exception:
                     pass
         threading.Thread(target=_work, daemon=True).start()
@@ -2157,8 +2202,16 @@ class VkTmuxBot:
                     except Exception:
                         pass
                 return self.vk.upload_doc(peer_id, path, title="голосовое.ogg")
-            # видео, кружки, файлы → документ (в VK нет круглого формата)
-            title = media.get("name") or ("видео-кружок" if kind == "video_note" else "файл")
+            if kind in ("video", "video_note"):
+                # Кружок/видео → грузим как проигрываемое видео VK (круглого формата нет)
+                title = "видео-кружок" if kind == "video_note" else (media.get("name") or "видео")
+                att = self.vk.upload_video(peer_id, path, title=title)
+                if att:
+                    return att
+                # не вышло видео — отдаём файлом, чтобы сообщение не потерялось
+                return self.vk.upload_doc(peer_id, path, title=title + ".mp4")
+            # прочие файлы → документ
+            title = media.get("name") or "файл"
             return self.vk.upload_doc(peer_id, path, title=title)
         except Exception as e:
             print(f"⚠️ медиа TG→VK не удалось: {e}")
@@ -2199,15 +2252,19 @@ class VkTmuxBot:
             body = f"{marker}\n{text}".rstrip() if text else marker
         return f"{head}\n{body}"
 
-    def _tg_context_card(self, chat_name, msgs):
-        """Стартовая карточка с последними сообщениями (контекст при открытии)."""
+    def _tg_context_card(self, chat_name, msgs, skip_ids=None):
+        """Стартовая карточка с последними сообщениями (контекст при открытии).
+        skip_ids — id сообщений, которые уйдут отдельными медиа-бабблами
+        (не дублируем их маркером в карточке)."""
+        skip_ids = skip_ids or set()
         header = (
             f"💬 {chat_name}   📡 на связи\n"
             f"✍️ просто напишите — уйдёт собеседнику\n"
             + "━" * 18
         )
         blocks = [self._tg_format_msg(s, txt, d, o, media)
-                  for (_id, s, txt, d, o, media) in (msgs or [])]
+                  for (_id, s, txt, d, o, media) in (msgs or [])
+                  if _id not in skip_ids]
         body = ""
         for b in reversed(blocks):
             chunk = b + "\n\n"
@@ -2304,13 +2361,17 @@ class VkTmuxBot:
                 tname = tmap.get(topic_id)
                 display = f"{chat_name} › {tname}" if tname else f"{chat_name} › топик"
 
-            card = self._tg_context_card(display, msgs)
+            # Выбираем медиа из свежего хвоста для загрузки реальными бабблами.
+            # Чисто-медийные (без подписи) убираем из карточки, чтобы не дублировать.
+            media_sel = self._select_context_media(msgs)
+            skip_ids = {m[0] for m in media_sel if not (m[2] or "").strip()}
+
+            card = self._tg_context_card(display, msgs, skip_ids=skip_ids)
             kb = self._tg_chat_kb(chat_id, user_id, topic_id=topic_id)
             self.vk.send_message(peer_id, card, keyboard=kb)
 
-            # Полный контекст: подгружаем медиа из последних сообщений
-            # (фото/голосовые/файлы) отдельными бабблами — не только маркерами.
-            self._tg_load_context_media(tg, user_id, peer_id, chat_id, msgs)
+            # Полный контекст: реальные медиа отдельными бабблами (в фоне).
+            self._tg_load_context_media(tg, user_id, peer_id, chat_id, media_sel)
 
             last_id = max((m[0] for m in msgs), default=0)
             prev = self.tg_state.get(user_id, {})
@@ -2461,11 +2522,23 @@ class VkTmuxBot:
                 snapshot = {c[1]: c[2] for c in dialogs}
                 seen = my_w.get("seen")
                 if seen is None:
-                    # Первый проход — базовая линия, без уведомлений
+                    # Первый проход — базовая линия, без уведомлений.
+                    # Для избранных запоминаем last_id, чтобы потом не вывалить историю.
                     my_w["seen"] = snapshot
+                    fl = my_w.setdefault("fav_last", {})
+                    favs0 = self.tg_favorites.get(user_id, set())
+                    for _n, cid, unread0, _p, _k in dialogs:
+                        if cid in favs0 and unread0 > 0:
+                            m0, e0 = tg.get_messages(cid, limit=1)
+                            if not e0 and m0:
+                                fl[cid] = m0[-1][0]
                     continue
 
-                # Находим чаты где непрочитанных стало больше
+                favs = self.tg_favorites.get(user_id, set())
+                fav_last = my_w.setdefault("fav_last", {})
+
+                # Находим чаты где непрочитанных стало больше.
+                # Избранные — пушим реальные сообщения; остальные — компактно.
                 notifications = []
                 for name, chat_id, unread, preview, kind in dialogs:
                     if chat_id in muted or chat_id == open_chat:
@@ -2473,11 +2546,15 @@ class VkTmuxBot:
                     old = seen.get(chat_id, 0)
                     if unread > old and unread > 0:
                         icon = self._TG_KIND_ICON.get(kind, "💬")
-                        notifications.append((name, chat_id, unread, preview, icon))
+                        if chat_id in favs:
+                            self._tg_push_favorite(user_id, peer_id, chat_id, name,
+                                                   icon, unread, fav_last)
+                        else:
+                            notifications.append((name, chat_id, unread, preview, icon))
 
                 my_w["seen"] = snapshot
 
-                # Шлём (не более 5 за раз, остальное — сводкой)
+                # Обычные (не избранные) — компактно, не более 5 за раз
                 for name, chat_id, unread, preview, icon in notifications[:5]:
                     kb = make_keyboard([[
                         {"label": f"💬 Открыть {name}"[:40], "color": "primary",
@@ -2496,6 +2573,39 @@ class VkTmuxBot:
 
         if self.tg_watch.get(user_id) is my_w:
             self._tg_watch_threads.pop(user_id, None)
+
+    def _tg_push_favorite(self, user_id, peer_id, chat_id, name, icon, unread, fav_last):
+        """Пуш реальных новых сообщений из ИЗБРАННОГО чата бабблами (текст+медиа)
+        с кнопкой перехода в диалог. Дедуп по последнему показанному id."""
+        tg = self._get_tg(user_id)
+        if not tg or not tg.is_ready:
+            return
+        try:
+            since = fav_last.get(chat_id, 0)
+            msgs, err = tg.get_messages(chat_id, limit=min(max(unread, 1), 8))
+            if err or not msgs:
+                return
+            # Только новые входящие (свои — не пушим, они и так синхронятся при открытии)
+            fresh = [m for m in msgs if m[0] > since and not m[4]]
+            fav_last[chat_id] = max((m[0] for m in msgs), default=since)
+            if not fresh:
+                return
+            jump_kb = make_keyboard([[
+                {"label": f"➡️ Перейти в диалог", "color": "primary",
+                 "payload": f"/tg open {chat_id}"},
+            ]], one_time=False)
+            # Шапка избранного, затем сами сообщения бабблами
+            self.vk.send_message(peer_id, f"⭐ {icon} {name}")
+            for i, (msg_id, sender, text, date, is_out, media) in enumerate(fresh[-5:]):
+                bubble = self._tg_format_msg(sender, text, date, is_out, media)
+                last = (i == len(fresh[-5:]) - 1)
+                kb = jump_kb if last else None
+                if media and media.get("kind") in ("photo", "file", "voice", "video", "video_note"):
+                    self._tg_proxy_incoming_async(user_id, peer_id, chat_id, msg_id, media, bubble, kb)
+                else:
+                    self.vk.send_message(peer_id, bubble, keyboard=kb)
+        except Exception:
+            pass
 
     def _resume_watches(self):
         """Восстановить сохранённые уведомления после перезапуска бота."""
@@ -2556,9 +2666,11 @@ class VkTmuxBot:
             print(f"⚠️ Не удалось восстановить чат user={user_id}: {e}")
 
     def _tg_live_loop(self, user_id):
-        """Поллинг чата: новые ВХОДЯЩИЕ сообщения постятся отдельными бабблами.
+        """Поллинг чата: новые сообщения постятся отдельными бабблами —
+        полная синхронизация диалога, как в настоящем клиенте.
 
-        Исходящие (твои) не дублируем — они уже видны как твои сообщения в VK.
+        Показываем и входящие, и исходящие с ДРУГИХ устройств (телефон/десктоп).
+        Отправленные из самого VK пропускаем по id (иначе дубль).
         """
         tg = self._get_tg(user_id)
         my_live = self.tg_live.get(user_id)   # мой словарь — по идентичности отличаю себя
@@ -2596,15 +2708,16 @@ class VkTmuxBot:
                 if not new_msgs:
                     continue
 
-                # Двигаем указатель СРАЗУ (и за входящие, и за исходящие) —
-                # исходящие не показываем, но и не теряем входящие (fix last_id race)
+                # Двигаем указатель СРАЗУ (за все новые) — не теряем сообщения
                 my_live["last_id"] = max(m[0] for m in new_msgs)
 
                 got_incoming = False
                 for msg_id, sender, text, date, is_out, media in new_msgs:
-                    if is_out:
-                        continue  # твои сообщения уже видны в VK
-                    got_incoming = True
+                    # Отправленное из самого VK не дублируем
+                    if is_out and self._is_vk_sent(user_id, msg_id):
+                        continue
+                    if not is_out:
+                        got_incoming = True
                     bubble = self._tg_format_msg(sender, text, date, is_out, media)
                     kb = self._tg_chat_kb(chat_id, user_id, topic_id=topic_id)
                     if media and media.get("kind") in ("photo", "file", "voice", "video", "video_note"):
@@ -2683,7 +2796,7 @@ class VkTmuxBot:
                                          topic_id=topic_id, voice=is_voice)
                     if ok:
                         sent += 1
-                        # last_id не трогаем — лента сама пропустит наше исходящее
+                        self._mark_vk_sent(user_id, m)  # m — id, лента не продублирует
                     else:
                         self.vk.send_message(peer_id, f"❌ Не отправилось в TG: {m}")
                 except Exception as e:
@@ -2729,11 +2842,12 @@ class VkTmuxBot:
             try:
                 if not self._tg_ensure_connected(tg, peer_id):
                     return
-                ok, msg = tg.send_message(chat_id, text, topic_id=topic_id)
+                ok, res = tg.send_message(chat_id, text, topic_id=topic_id)
                 if not ok:
-                    self.vk.send_message(peer_id, f"❌ {msg}")
-                # last_id двигать не нужно — живая лента сама пропустит наше
-                # исходящее (is_out) и не потеряет входящие между send и poll.
+                    self.vk.send_message(peer_id, f"❌ {res}")
+                else:
+                    # res — id отправленного; помечаем, чтобы лента не дублировала
+                    self._mark_vk_sent(user_id, res)
             except Exception as e:
                 self.vk.send_message(peer_id, f"❌ Ошибка отправки: {e}")
 

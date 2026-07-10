@@ -205,10 +205,21 @@ class TgClient:
                 return None
             return await self.client.download_media(m, file=dest_dir)
 
-        try:
-            return self._run(_dl(), timeout=300)
-        except Exception:
-            return None
+        # До 2 попыток: соединение по IPv6 иногда рвётся и отдаёт пустой файл
+        for attempt in range(2):
+            try:
+                path = self._run(_dl(), timeout=300)
+                if path and os.path.exists(path) and os.path.getsize(path) >= 16:
+                    return path
+                # пустой/битый — удалим и попробуем ещё раз
+                if path and os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        return None
 
     def send_file(self, chat_id, file_path, caption="", topic_id=None,
                   voice=False, video_note=False):
@@ -227,8 +238,11 @@ class TgClient:
             return await self.client.send_file(int(chat_id), file_path, **kwargs)
 
         try:
-            self._run(_send(), timeout=300)
-            return True, "✅ Отправлено"
+            sent = self._run(_send(), timeout=300)
+            sid = getattr(sent, "id", None)
+            if isinstance(sent, list) and sent:
+                sid = getattr(sent[-1], "id", None)
+            return True, sid
         except Exception as e:
             return False, f"Ошибка: {e}"
 
@@ -244,8 +258,8 @@ class TgClient:
             return await self.client.send_message(int(chat_id), text, **kwargs)
 
         try:
-            self._run(_send())
-            return True, "✅ Отправлено"
+            sent = self._run(_send())
+            return True, getattr(sent, "id", None)
         except Exception as e:
             return False, f"Ошибка: {e}"
 
