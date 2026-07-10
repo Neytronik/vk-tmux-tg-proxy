@@ -172,11 +172,17 @@ class TgClient:
                 media = None
                 if m.photo:
                     media = {"kind": "photo", "name": "фото", "size": 0}
+                elif getattr(m, "voice", None):
+                    media = {"kind": "voice", "name": "голосовое", "size": 0}
+                elif getattr(m, "video_note", None):
+                    media = {"kind": "video_note", "name": "видео-кружок", "size": 0}
                 elif m.document:
                     mime = getattr(m.document, "mime_type", "") or ""
                     fname = (m.file.name if m.file and m.file.name else "файл")
                     size = getattr(m.file, "size", 0) if m.file else 0
-                    if mime.startswith("video/"):
+                    if mime.startswith("audio/"):
+                        media = {"kind": "voice", "name": fname or "аудио", "size": size}
+                    elif mime.startswith("video/"):
                         media = {"kind": "video", "name": fname or "видео", "size": size}
                     else:
                         media = {"kind": "file", "name": fname, "size": size}
@@ -204,8 +210,9 @@ class TgClient:
         except Exception:
             return None
 
-    def send_file(self, chat_id, file_path, caption="", topic_id=None):
-        """Отправить файл/фото в чат/топик. Возвращает (ok, message)."""
+    def send_file(self, chat_id, file_path, caption="", topic_id=None,
+                  voice=False, video_note=False):
+        """Отправить файл/фото/голос/кружок в чат/топик. Возвращает (ok, message)."""
         if not self.is_ready:
             return False, "Не подключен к Telegram"
 
@@ -213,6 +220,10 @@ class TgClient:
             kwargs = {"caption": caption or None}
             if topic_id:
                 kwargs["reply_to"] = topic_id
+            if voice:
+                kwargs["voice_note"] = True
+            if video_note:
+                kwargs["video_note"] = True
             return await self.client.send_file(int(chat_id), file_path, **kwargs)
 
         try:

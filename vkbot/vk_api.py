@@ -234,6 +234,21 @@ class VkApi:
             doc = saved[0].get("doc", saved[0])
         return f"doc{doc['owner_id']}_{doc['id']}"
 
+    def upload_voice(self, peer_id, file_path):
+        """Загрузить голосовое сообщение (VK покажет как voice). Возвращает doc{owner}_{id}.
+        Файл должен быть .ogg (opus) — как отдаёт Telegram."""
+        server = self._call("docs.getMessagesUploadServer",
+                            {"type": "audio_message", "peer_id": peer_id})
+        upload_url = server["upload_url"]
+        with open(file_path, "rb") as f:
+            resp = requests.post(upload_url, files={"file": ("voice.ogg", f)}, timeout=120)
+        up = resp.json()
+        saved = self._call("docs.save", {"file": up["file"]})
+        doc = saved.get("audio_message") or saved.get("doc") if isinstance(saved, dict) else None
+        if not doc and isinstance(saved, list):
+            doc = saved[0].get("doc", saved[0])
+        return f"doc{doc['owner_id']}_{doc['id']}"
+
 
 # ── Клавиатуры ──────────────────────────────────────────────────
 

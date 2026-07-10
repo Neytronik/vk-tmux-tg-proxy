@@ -424,7 +424,7 @@ class TgTmuxBot:
         elif cmd in ("cancel", "отмена"):
             self._cmd_cancel(chat_id, args.strip())
         else:
-            self.api.send(chat_id, f"❓ Неизвестная команда: /{cmd}\n/help — список")
+            self.api.send(chat_id, f"❓ Неизвестная команда: /{cmd}", keyboard=self._menu_kb())
 
     def _cmd_help(self, chat_id, edit=None):
         msg = (
@@ -645,13 +645,13 @@ class TgTmuxBot:
     def _create_and_open(self, chat_id, name, full_args=None):
         import re
         if not re.match(r"^[a-zA-Z0-9_-]+$", name or ""):
-            self.api.send(chat_id, "❌ Имя: латиница, цифры, - и _.")
+            self.api.send(chat_id, "❌ Имя: латиница, цифры, - и _.", keyboard=self._nav_kb(chat_id))
             return
         if session_exists(name):
             self._attach_and_stream(chat_id, name)
             return
         if not self._create_tmux(name):
-            self.api.send(chat_id, "❌ Не удалось создать сессию.")
+            self.api.send(chat_id, "❌ Не удалось создать сессию.", keyboard=self._menu_kb())
             return
         # опциональная команда: /new имя команда
         if full_args:
@@ -765,7 +765,7 @@ class TgTmuxBot:
                 break
             session = my["session"]
             if not session_exists(session):
-                self.api.send(chat_id, f"❌ Сессия «{session}» завершилась.")
+                self.api.send(chat_id, f"❌ Сессия «{session}» завершилась.", keyboard=self._menu_kb())
                 self.streams.pop(chat_id, None)
                 self.sessions.pop(chat_id, None)
                 break
@@ -801,7 +801,7 @@ class TgTmuxBot:
             self.api.send(chat_id, "⚠️ Нет активной сессии.", keyboard=self._nav_kb(chat_id))
             return
         if not session_exists(session):
-            self.api.send(chat_id, f"❌ Сессия «{session}» не существует.")
+            self.api.send(chat_id, f"❌ Сессия «{session}» не существует.", keyboard=self._menu_kb())
             self.sessions.pop(chat_id, None)
             return
         self.api.typing(chat_id)
@@ -834,26 +834,27 @@ class TgTmuxBot:
         if not args.strip():
             ex = "/at 14:30" if is_at else "/in 5m"
             self.api.send(chat_id, f"⏰ Формат: {ex} сессия команда\n"
-                                   f"Пайплайн: {ex} s | cmd1 | cmd2 | 30s")
+                                   f"Пайплайн: {ex} s | cmd1 | cmd2 | 30s",
+                          keyboard=self._menu_kb())
             return
         if "|" in args:
             head, tail = args.split("|", 1)
             hp = head.strip().split(maxsplit=1)
             if len(hp) < 2:
-                self.api.send(chat_id, "❌ Нужно: время сессия | команды")
+                self.api.send(chat_id, "❌ Нужно: время сессия | команды", keyboard=self._menu_kb())
                 return
             when, session = hp
             commands, delay = parse_pipeline_args(tail.strip())
         else:
             parts = args.split(maxsplit=2)
             if len(parts) < 3:
-                self.api.send(chat_id, "❌ Нужно: время сессия команда")
+                self.api.send(chat_id, "❌ Нужно: время сессия команда", keyboard=self._menu_kb())
                 return
             when, session, cmd = parts
             commands, delay = [cmd], 10
         ts, desc = (_parse_at_time(when) if is_at else _parse_in_time(when))
         if ts is None:
-            self.api.send(chat_id, f"❌ {desc}")
+            self.api.send(chat_id, f"❌ {desc}", keyboard=self._menu_kb())
             return
         self._add_task(chat_id, ts, session, commands, delay, desc)
 

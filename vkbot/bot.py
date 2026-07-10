@@ -2125,10 +2125,20 @@ class VkTmuxBot:
             # VK лимиты: фото до ~50МБ, док до ~200МБ. Ограничим разумно.
             if size > 190 * 1024 * 1024:
                 return None
-            if media.get("kind") == "photo":
+            kind = media.get("kind")
+            if kind == "photo":
                 return self.vk.upload_photo(peer_id, path)
-            else:
-                return self.vk.upload_doc(peer_id, path, title=media.get("name"))
+            if kind == "voice":
+                # голосовое → VK voice (если .ogg); иначе как файл
+                if path.lower().endswith((".ogg", ".oga")):
+                    try:
+                        return self.vk.upload_voice(peer_id, path)
+                    except Exception:
+                        pass
+                return self.vk.upload_doc(peer_id, path, title="голосовое.ogg")
+            # видео, кружки, файлы → документ (в VK нет круглого формата)
+            title = media.get("name") or ("видео-кружок" if kind == "video_note" else "файл")
+            return self.vk.upload_doc(peer_id, path, title=title)
         except Exception as e:
             print(f"⚠️ медиа TG→VK не удалось: {e}")
             return None
@@ -2146,8 +2156,12 @@ class VkTmuxBot:
         kind = media.get("kind")
         if kind == "photo":
             return "📷 фото"
+        if kind == "voice":
+            return "🎤 голосовое"
+        if kind == "video_note":
+            return "⭕ видео-кружок"
         if kind == "video":
-            return "🎥 видео (открой в Telegram)"
+            return "🎥 видео"
         name = media.get("name", "файл")
         return f"📎 {name}"
 
@@ -2568,7 +2582,7 @@ class VkTmuxBot:
                     got_incoming = True
                     bubble = self._tg_format_msg(sender, text, date, is_out, media)
                     kb = self._tg_chat_kb(chat_id, user_id, topic_id=topic_id)
-                    if media and media.get("kind") in ("photo", "file"):
+                    if media and media.get("kind") in ("photo", "file", "voice", "video", "video_note"):
                         # Медиа проксируем в ОТДЕЛЬНОМ потоке, чтобы не блокировать ленту
                         self._tg_proxy_incoming_async(user_id, peer_id, chat_id, msg_id, media, bubble, kb)
                     else:
@@ -2605,13 +2619,19 @@ class VkTmuxBot:
             sent, skipped = 0, 0
             for att in attachments:
                 atype = att.get("type")
-                url, fname = None, None
+                url, fname, is_voice = None, None, False
                 if atype == "photo":
                     sizes = att.get("photo", {}).get("sizes", [])
                     if sizes:
                         best = max(sizes, key=lambda s: s.get("width", 0) * s.get("height", 0))
                         url = best.get("url")
                         fname = "photo.jpg"
+                elif atype == "audio_message":
+                    # голосовое из VK → голосовое в TG
+                    am = att.get("audio_message", {})
+                    url = am.get("link_ogg") or am.get("link_mp3")
+                    fname = "voice.ogg"
+                    is_voice = True
                 elif atype == "doc":
                     doc = att.get("doc", {})
                     url = doc.get("url")
@@ -2619,6 +2639,9 @@ class VkTmuxBot:
                     ext = doc.get("ext", "")
                     if ext and not fname.endswith(ext):
                         fname = f"{fname}.{ext}"
+                    # VK-голосовое иногда приходит как doc audio_message
+                    if att.get("doc", {}).get("type") == 5:
+                        is_voice = True
                 if not url:
                     skipped += 1
                     continue
@@ -2632,7 +2655,7 @@ class VkTmuxBot:
                     with open(path, "wb") as f:
                         f.write(r.content)
                     ok, m = tg.send_file(chat_id, path, caption=caption if sent == 0 else "",
-                                         topic_id=topic_id)
+                                         topic_id=topic_id, voice=is_voice)
                     if ok:
                         sent += 1
                         # last_id не трогаем — лента сама пропустит наше исходящее
