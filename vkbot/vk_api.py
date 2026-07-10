@@ -518,7 +518,10 @@ def make_watch_keyboard():
             {"label": "🔄 Обновить", "color": PRIMARY, "payload": "/o"},
         ],
         [
+            {"label": "🔀 Сессии", "color": PRIMARY, "payload": "/ls"},
             {"label": "🏠 Меню", "color": PRIMARY, "payload": "/menu"},
+        ],
+        [
             {"label": "🔽 Свернуть", "color": SECONDARY, "payload": "/unwatch"},
             {"label": "❌ Завершить", "color": NEGATIVE, "payload": "/killcur"},
         ],

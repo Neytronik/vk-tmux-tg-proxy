@@ -72,6 +72,34 @@ def get_output(session_name, lines=60):
     return _filter_separators(out)
 
 
+# Оболочки, стоящие «на приглашении» — тут удобна ЛЕНТА.
+_SHELL_CMDS = {"bash", "zsh", "sh", "fish", "dash", "ash", "ksh",
+               "-bash", "-zsh", "-sh"}
+
+
+def is_tui(session_name):
+    """True, если в панели нужен «живой экран» (правка одного сообщения):
+    alt-screen приложение (vim/htop/less) ИЛИ активна программа с
+    перерисовкой (Claude Code — node, сборка и т.п.). False — если панель
+    стоит на приглашении оболочки: тогда удобнее ЛЕНТА.
+
+    Claude Code перерисовывается инлайн (без alt-screen), поэтому одного
+    alternate_on мало — смотрим ещё и процесс на переднем плане."""
+    ok, alt = _tmux("display-message", "-p", "-t", session_name, "#{alternate_on}")
+    if ok and alt.strip() == "1":
+        return True
+    ok2, cmd = _tmux("display-message", "-p", "-t", session_name, "#{pane_current_command}")
+    if not ok2:
+        return True  # не смогли определить — безопаснее живой экран
+    return cmd.strip().lower() not in _SHELL_CMDS
+
+
+def capture_scrollback(session_name, lines=200):
+    """Сырой вывод панели с историей (для режима ленты)."""
+    ok, out = _tmux("capture-pane", "-p", "-t", session_name, "-S", f"-{lines}")
+    return out if ok else ""
+
+
 def _filter_separators(output):
     """Отфильтровать строки-разделители (─── и т.п.)."""
     lines = output.split("\n")

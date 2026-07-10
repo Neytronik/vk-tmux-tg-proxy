@@ -510,6 +510,23 @@ class TestVkKeyboards(unittest.TestCase):
         self.assertFalse(any(p.strip() == "/kill a" for p in payloads))
         self.assertFalse(kb["one_time"])
 
+    def test_feed_delta(self):
+        """Дельта ленты: дописанные строки с учётом прокрутки терминала."""
+        from vkbot.bot import VkTmuxBot as B
+        self.assertEqual(B._feed_delta(["A", "B", "C"], ["A", "B", "C", "D"]), ["D"])
+        self.assertEqual(B._feed_delta(["A", "B", "C"], ["B", "C", "D"]), ["D"])
+        self.assertEqual(B._feed_delta(["A", "B"], ["A", "B"]), [])
+        self.assertEqual(B._feed_delta(["A"], ["X", "Y"]), ["X", "Y"])
+
+    def test_feed_chunk(self):
+        """Резка длинного вывода на куски под лимит сообщения."""
+        from vkbot.bot import VkTmuxBot as B
+        text = "\n".join(f"line{i}" for i in range(500))
+        chunks = B._chunk_text(text, 200)
+        self.assertTrue(all(len(c) <= 200 for c in chunks))
+        # ничего не потеряли (по строкам)
+        self.assertEqual("\n".join(chunks).count("line"), 500)
+
     def test_kill_confirm_keyboard(self):
         """Подтверждение удаления: есть явное «Да» (/kill name) и отмена (/kill)."""
         from vkbot.vk_api import make_kill_confirm_keyboard

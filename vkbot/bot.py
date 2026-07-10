@@ -37,6 +37,8 @@ from .tmux_handler import (
     detect_session_state,
     format_output,
     clean_pane,
+    is_tui,
+    capture_scrollback,
 )
 from .state_manager import save_state, load_state
 from .scheduler import (
@@ -3339,10 +3341,59 @@ class VkTmuxBot:
         self._watch_threads[user_id] = t
         t.start()
 
+    @staticmethod
+    def _clean_lines(raw):
+        """Очистить захват панели в список строк без хвостовых пустых."""
+        lines = clean_pane(raw).split("\n")
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return lines
+
+    @staticmethod
+    def _feed_delta(prev, cur):
+        """Новые строки cur относительно prev с учётом прокрутки терминала.
+        Ищем наибольшее перекрытие «хвост prev == начало cur»."""
+        max_ov = min(len(prev), len(cur))
+        for k in range(max_ov, 0, -1):
+            if prev[-k:] == cur[:k]:
+                return cur[k:]
+        return cur  # нет перекрытия — экран сменился целиком
+
+    @staticmethod
+    def _chunk_text(text, size=3500):
+        """Порезать длинный текст на куски по строкам (лимит сообщения VK)."""
+        out, buf = [], ""
+        for line in text.split("\n"):
+            if len(buf) + len(line) + 1 > size:
+                if buf:
+                    out.append(buf)
+                buf = line
+            else:
+                buf = f"{buf}\n{line}" if buf else line
+        if buf:
+            out.append(buf)
+        return out
+
+    def _feed_tick(self, ws, session, peer_id):
+        """Один шаг режима ЛЕНТЫ: дописать новый вывод новыми сообщениями."""
+        cur = self._clean_lines(capture_scrollback(session, 200))
+        prev = ws.get("feed_lines") or []
+        delta = self._feed_delta(prev, cur)
+        ws["feed_lines"] = cur
+        text = "\n".join(delta).strip("\n")
+        if not text.strip():
+            return
+        for chunk in self._chunk_text(text, 3500):
+            try:
+                self.vk.send_message(peer_id, chunk, keyboard=make_watch_keyboard())
+            except Exception:
+                pass
+
     def _watch_loop(self, user_id):
         """Цикл автообновления (выполняется в отдельном потоке).
-        Плюс детект простоя: если вывод не меняется N минут — уведомление
-        (например, Claude завершил задачу/петлю)."""
+        Гибрид: TUI (Claude/vim/htop) — живой экран правкой одного сообщения;
+        обычная оболочка — ЛЕНТА (новый вывод новыми сообщениями).
+        Плюс детект простоя: если вывод не меняется N минут — уведомление."""
         my_ws = self._get_watch(user_id)   # мой словарь — идентичность отличает поток
         if not my_ws:
             return
@@ -3375,6 +3426,44 @@ class VkTmuxBot:
                 self._save_state()
                 break
 
+            # ── Гибрид: определяем режим (TUI живой экран / лента оболочки) ──
+            try:
+                tui = is_tui(session)
+            except Exception:
+                tui = True  # безопасно: считаем TUI (правим одно сообщение)
+            prev_mode = ws.get("mode", "tui")
+            cur_mode = "tui" if tui else "feed"
+            if cur_mode != prev_mode:
+                ws["mode"] = cur_mode
+                if cur_mode == "feed":
+                    # переход в ленту: базовая линия без вываливания истории
+                    ws["feed_lines"] = self._clean_lines(capture_scrollback(session, 200))
+                    try:
+                        self.vk.send_message(peer_id, "▶️ Обычный терминал — вывод идёт лентой.",
+                                             keyboard=make_watch_keyboard())
+                    except Exception:
+                        pass
+                else:
+                    # вернулись в TUI: свежее сообщение под живой экран
+                    last_output = ""
+                    edit_count = 0
+                    try:
+                        formatted = format_output(session, get_output(session, self.config["tmux"]["output_lines"]))
+                        mid = self.vk.send_message(peer_id, formatted, keyboard=make_watch_keyboard())
+                        with self._lock:
+                            if user_id in self.watching_sessions:
+                                self.watching_sessions[user_id]["message_id"] = mid
+                    except Exception:
+                        pass
+                time.sleep(interval)
+                continue
+
+            if cur_mode == "feed":
+                self._feed_tick(ws, session, peer_id)
+                time.sleep(interval)
+                continue
+
+            # ── Режим TUI (живой экран) ──
             try:
                 output = get_output(session, self.config["tmux"]["output_lines"])
             except Exception:
