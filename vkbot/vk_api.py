@@ -173,6 +173,14 @@ class VkApi:
             params["message_ids"] = message_id
         return self._call("messages.delete", params)
 
+    def set_typing(self, peer_id):
+        """Показать индикатор «… печатает» (живёт ~10с или до отправки сообщения).
+        Заменяет спам «Загружаю…» на нативную реакцию."""
+        try:
+            return self._call("messages.setActivity", {"peer_id": peer_id, "type": "typing"})
+        except Exception:
+            return None
+
     def send_message_event_answer(self, event_id, user_id, peer_id, event_data=None):
         """Ответить на callback-событие (inline keyboard)."""
         params = {
@@ -380,7 +388,7 @@ def make_kill_keyboard(sessions):
             row = []
     if row:
         buttons.append(row)
-    return make_keyboard(buttons, one_time=True)
+    return make_keyboard(buttons, one_time=False)
 
 
 def make_watch_keyboard():
@@ -407,4 +415,4 @@ def make_notify_keyboard(current_state):
     return make_keyboard([[
         {"label": on_label, "color": on_color, "payload": "/notify on"},
         {"label": off_label, "color": off_color, "payload": "/notify off"},
-    ]], one_time=True)
+    ]], one_time=False)

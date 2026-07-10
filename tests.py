@@ -503,7 +503,7 @@ class TestVkKeyboards(unittest.TestCase):
                 labels.append(btn["action"]["label"])
         self.assertIn("🗑 a", labels)
         self.assertIn("🗑 b", labels)
-        self.assertTrue(kb["one_time"])
+        self.assertFalse(kb["one_time"])  # консистентно с остальными меню
 
     def test_watch_keyboard(self):
         """Клавиатура watch mode."""

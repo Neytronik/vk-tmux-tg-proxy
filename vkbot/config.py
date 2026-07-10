@@ -102,10 +102,13 @@ def load_config():
         print("❌ Не указан vk.group_id в конфиге")
         return None
 
-    # Если admin_ids не заданы — админом становится первый из allowed
+    # Если admin_ids не заданы — админом становится первый из allowed (с предупреждением)
     if not config["vk"].get("admin_ids"):
         allowed = config["vk"].get("allowed_user_ids", [])
         config["vk"]["admin_ids"] = [allowed[0]] if allowed else []
+        if allowed:
+            print(f"⚠️  admin_ids не задан — админом назначен первый в allowed: {allowed[0]}")
+            print("   Чтобы задать явно, добавьте vk.admin_ids в config.yaml")
 
     return config
 

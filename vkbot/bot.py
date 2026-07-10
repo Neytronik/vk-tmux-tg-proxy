@@ -112,6 +112,8 @@ class VkTmuxBot:
         self.tg_watch_cfg = {}        # {user_id: interval_sec} — сохранённые настройки
         self.tg_open_chat = {}        # {user_id: {chat_id, topic_id}} — открытый чат (персист)
         self._tg_lock = threading.Lock()  # защита избранного/мутов/настроек
+        self._clients_lock = threading.Lock()  # защита создания TG-клиентов
+        self._persist_lock = threading.Lock()  # защита записи JSON-файлов
         self.users = {}               # динамические пользователи {id: {tmux, name}}
         self.pending_admin = {}       # {user_id: "mode"} — ввод в админке
         self.tg_accounts = {}         # {user_id: {"active": slug, "accounts": {slug: label}}}
@@ -251,6 +253,16 @@ class VkTmuxBot:
         # Останавливаем планировщик
         self.scheduler.stop()
 
+        # Отключаем все Telegram-клиенты (закрываем event-loop потоки)
+        with self._clients_lock:
+            clients = list(self.tg_clients.values())
+            self.tg_clients.clear()
+        for c in clients:
+            try:
+                c.disconnect()
+            except Exception:
+                pass
+
         self._save_state()
         print("✅ Состояние сохранено")
 
@@ -330,6 +342,7 @@ class VkTmuxBot:
 
         # Вложения в активном TG-чате → проксируем в Telegram (фото/файлы)
         if attachments and user_id in self.tg_live:
+            self.vk.set_typing(peer_id)
             self._delete_msg(peer_id, msg_id)
             self._tg_send_media(peer_id, user_id, attachments, text)
             return
@@ -346,9 +359,9 @@ class VkTmuxBot:
             except (json.JSONDecodeError, TypeError):
                 pass
 
-        # Нажатие кнопки во время ожидания ввода — отменяем ожидание,
-        # выполняем команду кнопки (иначе payload улетит как текст ответа)
-        if is_button:
+        # Кнопка ИЛИ слэш-команда во время ожидания ввода — отменяем ожидание
+        # и выполняем команду (иначе она улетит как текст ответа/поиска)
+        if is_button or text.startswith("/"):
             self.pending_new_session.pop(user_id, None)
             self.pending_input.pop(user_id, None)
             self.pending_admin.pop(user_id, None)
@@ -386,12 +399,15 @@ class VkTmuxBot:
             # В активном TG-чате — текст уходит собеседнику (как в мессенджере)
             self._delete_msg(peer_id, msg_id)
             self._tg_send(peer_id, user_id, text)
-        elif self._get_session(user_id) is not None:
+        elif self._get_session(user_id) is not None and self._can_tmux(user_id):
             # Нет / — отправляем как команду в активную tmux-сессию
             self._send_as_command(peer_id, user_id, text)
             self._delete_msg(peer_id, msg_id)
         # Иначе: просто текст без контекста — показываем help
         elif text and not text.startswith("/"):
+            # Если сессия осталась у юзера без доступа — снимаем её
+            if self._get_session(user_id) is not None and not self._can_tmux(user_id):
+                self._del_session(user_id)
             self._cmd_help(peer_id, user_id, "")
 
     def _handle_callback(self, obj):
@@ -447,6 +463,11 @@ class VkTmuxBot:
         if cmd in self._ADMIN_CMDS and not self._is_admin(user_id):
             self.vk.send_message(peer_id, "🔒 Только для администратора.")
             return
+
+        # «… печатает» вместо спама «Загружаю…» для команд, что грузят контент
+        if cmd in ("tg", "тг", "o", "output", "вывод", "attach", "подключить",
+                   "claude", "клод", "dcc", "дкк", "ls", "sessions", "сессии"):
+            self.vk.set_typing(peer_id)
 
         # Команды, которые отправляют текст в tmux — удаляем сообщение юзера
         TMUX_CMDS = {"s", "send", "отправить", "e", "enter", "c", "d"}
@@ -780,7 +801,7 @@ class VkTmuxBot:
 
     def _create_session_from_input(self, peer_id, user_id, text):
         """Создать сессию из текстового ввода. Поддерживает 'имя команда'."""
-        del self.pending_new_session[user_id]
+        self.pending_new_session.pop(user_id, None)
         text = text.strip()
 
         # Разбираем: имя [команда]
@@ -998,7 +1019,7 @@ class VkTmuxBot:
 
     def _send_command_input(self, peer_id, user_id, text):
         """Отправить команду из режима ожидания."""
-        del self.pending_input[user_id]
+        self.pending_input.pop(user_id, None)
         self._send_text(peer_id, user_id, text)
 
     def _send_as_command(self, peer_id, user_id, text):
@@ -1112,12 +1133,11 @@ class VkTmuxBot:
     def _launch_ai(self, peer_id, user_id, session_name, command, label):
         """Общий запуск AI-сессии: подключиться если есть, иначе создать+запустить.
         В обоих случаях — сразу watch (живой вывод + детект простоя)."""
+        self.vk.set_typing(peer_id)  # «печатает» вместо текста-заглушки
         if session_exists(session_name):
             self._set_session(user_id, session_name)
             self._save_state()
-            self.vk.send_message(peer_id, f"{label}: подключаюсь к сессии…")
         else:
-            self.vk.send_message(peer_id, f"{label}: создаю сессию и запускаю…")
             work_dir = self.config["tmux"].get("work_dir", None)
             if not create_session(session_name, work_dir=work_dir):
                 self.vk.send_message(peer_id, "❌ Не удалось создать сессию.")
@@ -1254,9 +1274,40 @@ class VkTmuxBot:
         u = self.users.setdefault(uid, {"tmux": False, "name": ""})
         u["tmux"] = False
         self._save_users()
+        # Немедленно отключаем: снимаем активную сессию и tmux-watch
+        self._del_session(uid)
+        ws = self._get_watch(uid)
+        if ws:
+            ws["stop"] = True
+            self._del_watch(uid)
+            self._watch_threads.pop(uid, None)
+        self._save_state()
         self.vk.send_message(peer_id, f"✅ У пользователя {uid} забран доступ к серверу. Telegram остался.")
 
     # ── Telegram прокси ───────────────────────────────────────────
+
+    def _atomic_json(self, path, data):
+        """Атомарная запись JSON: пишем во временный файл и os.replace.
+        Защищено локом — безопасно из нескольких потоков."""
+        import os, json as _json, tempfile
+        from .config import CONFIG_DIR
+        try:
+            os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+            with self._persist_lock:
+                fd, tmp = tempfile.mkstemp(dir=CONFIG_DIR, suffix=".tmp")
+                try:
+                    with os.fdopen(fd, "w") as f:
+                        _json.dump(data, f, ensure_ascii=False, indent=2)
+                    os.replace(tmp, path)
+                    os.chmod(path, 0o600)
+                except Exception:
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
+                    raise
+        except Exception as e:
+            print(f"⚠️ Не удалось сохранить {os.path.basename(path)}: {e}")
 
     def _fav_file(self):
         import os
@@ -1270,27 +1321,15 @@ class VkTmuxBot:
 
     def _save_open_chat(self, user_id, chat_id, topic_id):
         """Запомнить открытый чат (для восстановления после ребута)."""
-        import json as _json, os
-        from .config import CONFIG_DIR
         self.tg_open_chat[user_id] = {"chat_id": chat_id, "topic_id": topic_id}
-        os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
-        try:
-            data = {str(u): v for u, v in self.tg_open_chat.items()}
-            with open(self._openchat_file(), "w") as f:
-                _json.dump(data, f)
-        except Exception:
-            pass
+        self._atomic_json(self._openchat_file(),
+                          {str(u): v for u, v in dict(self.tg_open_chat).items()})
 
     def _clear_open_chat(self, user_id):
         """Забыть открытый чат (пользователь вышел в список)."""
-        import json as _json
         self.tg_open_chat.pop(user_id, None)
-        try:
-            data = {str(u): v for u, v in self.tg_open_chat.items()}
-            with open(self._openchat_file(), "w") as f:
-                _json.dump(data, f)
-        except Exception:
-            pass
+        self._atomic_json(self._openchat_file(),
+                          {str(u): v for u, v in dict(self.tg_open_chat).items()})
 
     def _load_open_chats(self):
         import os, json as _json
@@ -1322,20 +1361,13 @@ class VkTmuxBot:
             self.tg_favorites, self.tg_muted, self.tg_watch_cfg = {}, {}, {}
 
     def _save_favorites(self):
-        import json as _json, os
-        from .config import CONFIG_DIR
-        os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
-        try:
-            with self._tg_lock:  # снимок под локом — без гонки итерации
-                data = {
-                    "favorites": {str(u): list(ids) for u, ids in self.tg_favorites.items()},
-                    "muted": {str(u): list(ids) for u, ids in self.tg_muted.items()},
-                    "watch": {str(u): v for u, v in self.tg_watch_cfg.items()},
-                }
-            with open(self._fav_file(), "w") as f:
-                _json.dump(data, f)
-        except Exception:
-            pass
+        with self._tg_lock:  # снимок под локом — без гонки итерации
+            data = {
+                "favorites": {str(u): list(ids) for u, ids in self.tg_favorites.items()},
+                "muted": {str(u): list(ids) for u, ids in self.tg_muted.items()},
+                "watch": {str(u): v for u, v in self.tg_watch_cfg.items()},
+            }
+        self._atomic_json(self._fav_file(), data)
 
     def _tg_set_fav(self, user_id, chat_id, add):
         with self._tg_lock:
@@ -1369,13 +1401,8 @@ class VkTmuxBot:
             self.tg_accounts = {}
 
     def _save_accounts(self):
-        import json as _json
-        try:
-            with open(self._accounts_file(), "w") as f:
-                _json.dump({str(u): v for u, v in self.tg_accounts.items()}, f,
-                           ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        self._atomic_json(self._accounts_file(),
+                          {str(u): v for u, v in dict(self.tg_accounts).items()})
 
     def _user_accounts(self, user_id):
         """Аккаунты пользователя. По умолчанию один — 'main'."""
@@ -1402,9 +1429,11 @@ class VkTmuxBot:
             return None
         slug = self._active_slug(user_id)
         key = (user_id, slug)
-        if key not in self.tg_clients:
-            self.tg_clients[key] = TgClient(api_id, api_hash, self._session_path(user_id, slug))
-        return self.tg_clients[key]
+        # Лок, чтобы два потока не создали двух клиентов на один файл сессии
+        with self._clients_lock:
+            if key not in self.tg_clients:
+                self.tg_clients[key] = TgClient(api_id, api_hash, self._session_path(user_id, slug))
+            return self.tg_clients[key]
 
     def _tg_switch_account(self, peer_id, user_id, slug):
         """Переключить активный аккаунт."""
@@ -1412,11 +1441,22 @@ class VkTmuxBot:
         if slug not in acc["accounts"]:
             self.vk.send_message(peer_id, "❌ Такого аккаунта нет.")
             return
-        # Останавливаем ленту/уведомления старого аккаунта
+        if slug == acc.get("active"):
+            self.vk.send_message(peer_id, "Этот аккаунт уже активен.")
+            return
+        # Останавливаем ленту/уведомления и отключаем клиент старого аккаунта
         self._tg_stop_live(user_id)
         self._stop_watch(user_id)
         self._clear_open_chat(user_id)
         self.tg_state.pop(user_id, None)
+        old_key = (user_id, acc.get("active", "main"))
+        with self._clients_lock:
+            old = self.tg_clients.pop(old_key, None)
+        if old:
+            try:
+                old.disconnect()
+            except Exception:
+                pass
         acc["active"] = slug
         self._save_accounts()
         label = acc["accounts"][slug]
@@ -1583,17 +1623,17 @@ class VkTmuxBot:
         tg = self._get_tg(user_id)
 
         if mode == "tg_search":
-            del self.pending_input[user_id]
+            self.pending_input.pop(user_id, None)
             self._tg_search(peer_id, user_id, text.strip())
             return
 
         if mode == "tg_newaccount":
-            del self.pending_input[user_id]
+            self.pending_input.pop(user_id, None)
             self._tg_create_account(peer_id, user_id, text.strip())
             return
 
         if mode in ("tg_phone", "tg_code", "tg_password", "tg_reply"):
-            del self.pending_input[user_id]
+            self.pending_input.pop(user_id, None)
             t = threading.Thread(
                 target=self._tg_handle_input_async,
                 args=(peer_id, user_id, text, mode, tg),
@@ -2409,13 +2449,14 @@ class VkTmuxBot:
             display = chat_name
             if topic_id:
                 display = f"{chat_name} › топик"
-            card = self._tg_context_card(display, msgs)
-            kb = self._tg_chat_kb(chat_id, user_id, topic_id=topic_id)
+            # Компактно: не вываливаем всю карточку, а даём вернуться одним тапом.
+            # Живую ленту запускаем — новые входящие появятся сами.
+            payload = f"/tg topic {chat_id} {topic_id}" if topic_id else f"/tg open {chat_id}"
+            kb = make_keyboard([[
+                {"label": f"↩️ Открыть {display}"[:40], "color": "primary", "payload": payload},
+            ]], one_time=False)
             self.vk.send_message(
-                peer_id,
-                f"🔄 Продолжаем диалог (после перезапуска)\n\n{card}",
-                keyboard=kb,
-            )
+                peer_id, f"🔄 После перезапуска: вы были в диалоге с «{display}».", keyboard=kb)
             last_id = max((m[0] for m in msgs), default=0)
             prev = self.tg_state.get(user_id, {})
             self.tg_state[user_id] = {
@@ -2881,9 +2922,8 @@ class VkTmuxBot:
 
     def _start_watch_thread(self, user_id):
         """Запустить поток автообновления."""
-        if user_id in self._watch_threads:
-            return
-
+        # Гарантируем, что старый поток помечен на остановку и снят с учёта
+        self._watch_threads.pop(user_id, None)
         t = threading.Thread(target=self._watch_loop, args=(user_id,), daemon=True)
         self._watch_threads[user_id] = t
         t.start()
@@ -2892,6 +2932,9 @@ class VkTmuxBot:
         """Цикл автообновления (выполняется в отдельном потоке).
         Плюс детект простоя: если вывод не меняется N минут — уведомление
         (например, Claude завершил задачу/петлю)."""
+        my_ws = self._get_watch(user_id)   # мой словарь — идентичность отличает поток
+        if not my_ws:
+            return
         last_output = ""
         interval = self.config["tmux"].get("watch_interval", 2.0)
         idle_minutes = self.config["tmux"].get("idle_notify_minutes", 10)
@@ -2904,7 +2947,8 @@ class VkTmuxBot:
 
         while True:
             ws = self._get_watch(user_id)
-            if not ws or ws.get("stop"):
+            # Новый watch-поток запущен → этот завершается
+            if not ws or ws is not my_ws or ws.get("stop"):
                 break
 
             session = ws["session"]
@@ -2998,7 +3042,9 @@ class VkTmuxBot:
 
             time.sleep(interval)
 
-        self._watch_threads.pop(user_id, None)
+        # Снимаем регистрацию только если это всё ещё мой поток
+        if self._watch_threads.get(user_id) is threading.current_thread():
+            self._watch_threads.pop(user_id, None)
 
     # ── Возобновление watch ──────────────────────────────────────
 
