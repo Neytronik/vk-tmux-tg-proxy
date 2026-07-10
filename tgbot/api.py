@@ -29,6 +29,11 @@ class TgBotApi:
         self.rate_limit_delay = rate_limit_delay
         self._last = 0
         self._lock = threading.Lock()
+        # Постоянная сессия с пулом соединений — переиспользуем TCP/TLS,
+        # чтобы не платить за новый connect на каждый запрос.
+        self._session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=8)
+        self._session.mount("https://", adapter)
 
     def _rate_limit(self):
         with self._lock:
@@ -38,15 +43,32 @@ class TgBotApi:
                 time.sleep(self.rate_limit_delay - gap)
             self._last = time.time()
 
-    def _call(self, method, params=None, timeout=35, _retry=True):
+    def _call(self, method, params=None, timeout=20, _retry=True):
         self._rate_limit()
-        try:
-            resp = requests.post(f"{self.base}/{method}", data=params or {}, timeout=timeout)
-            data = resp.json()
-        except requests.RequestException as e:
-            raise TgBotError(-1, f"Сеть: {e}")
-        except json.JSONDecodeError:
-            raise TgBotError(-1, "Некорректный ответ")
+        # (connect, read): короткий connect, чтобы перемежающаяся блокировка
+        # Telegram не вешала запрос на 35с; read — под длинный опрос.
+        to = (8, timeout)
+        # Ретраим ТОЛЬКО быстрые сбои соединения (connect/пул) — повтор часто
+        # выручает при флапе Telegram. На read-таймаут не ретраим: мы уже
+        # прождали полный timeout, повтор просто утроит ожидание.
+        last_err = None
+        for attempt in range(3):
+            try:
+                resp = self._session.post(f"{self.base}/{method}", data=params or {}, timeout=to)
+                data = resp.json()
+                break
+            except json.JSONDecodeError:
+                raise TgBotError(-1, "Некорректный ответ")
+            except (requests.exceptions.ConnectTimeout,
+                    requests.exceptions.ConnectionError) as e:
+                last_err = e
+                time.sleep(0.6 * (attempt + 1))
+            except requests.RequestException as e:
+                # read-timeout и прочее — без повторов
+                raise TgBotError(-1, f"Сеть: {e}")
+        else:
+            raise TgBotError(-1, f"Сеть: {last_err}")
+
         if not data.get("ok"):
             code = data.get("error_code", -1)
             # 429 Too Many Requests — честно ждём retry_after и пробуем один раз
