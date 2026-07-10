@@ -392,15 +392,28 @@ def make_kill_keyboard(sessions):
 
 
 def make_watch_keyboard():
-    """Клавиатура во время watch mode."""
+    """Пульт управления сессией/Claude Code: стрелки, спецклавиши, навигация.
+    Показывается во время watch — когда вы «внутри» сессии."""
     return make_keyboard([
         [
-            {"label": "⛔ Ctrl+C", "color": NEGATIVE, "payload": "/c"},
-            {"label": "⏎ Enter", "color": SECONDARY, "payload": "/e"},
+            {"label": "⬆️", "color": SECONDARY, "payload": "/up"},
+            {"label": "⏎ Enter", "color": POSITIVE, "payload": "/e"},
+            {"label": "⎋ Esc", "color": SECONDARY, "payload": "/esc"},
         ],
         [
-            {"label": "🛑 Стоп", "color": NEGATIVE, "payload": "/unwatch"},
+            {"label": "⬅️", "color": SECONDARY, "payload": "/left"},
+            {"label": "⬇️", "color": SECONDARY, "payload": "/down"},
+            {"label": "➡️", "color": SECONDARY, "payload": "/right"},
+        ],
+        [
+            {"label": "⇥ Tab", "color": SECONDARY, "payload": "/tab"},
+            {"label": "⇧⇥ Shift+Tab", "color": SECONDARY, "payload": "/btab"},
+            {"label": "⛔ Ctrl+C", "color": NEGATIVE, "payload": "/c"},
+        ],
+        [
             {"label": "🔄 Обновить", "color": PRIMARY, "payload": "/o"},
+            {"label": "🏠 Меню", "color": PRIMARY, "payload": "/menu"},
+            {"label": "🛑 Стоп", "color": NEGATIVE, "payload": "/unwatch"},
         ],
     ], one_time=False)
 

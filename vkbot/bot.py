@@ -58,32 +58,47 @@ def _translit(text):
 
 
 # Форматирование вывода терминала для VK
+def _clean_pane(raw_output):
+    """Убрать хвостовые пробелы (tmux добивает строки до ширины панели — из-за
+    этого в VK всё «едет») и схлопнуть лишние пустые строки."""
+    lines = [ln.rstrip() for ln in raw_output.split("\n")]
+    # схлопываем 3+ подряд пустых строк в одну
+    cleaned = []
+    blank = 0
+    for ln in lines:
+        if ln == "":
+            blank += 1
+            if blank <= 1:
+                cleaned.append(ln)
+        else:
+            blank = 0
+            cleaned.append(ln)
+    return "\n".join(cleaned).strip("\n")
+
+
 def format_output(session_name, raw_output, max_len=3500):
-    """Оформить вывод tmux для отображения в VK."""
-    output = raw_output.strip()
-    if not output:
-        output = "(пустой вывод — нажмите Enter или отправьте команду)"
+    """Оформить вывод tmux для отображения в VK (компактно, без «съезда»)."""
+    output = _clean_pane(raw_output)
+    if not output.strip():
+        output = "(пусто — напишите текст или нажмите ⏎)"
 
-    # Ограничиваем длину (лимит VK 4096, оставляем запас)
-    if len(output) > max_len:
-        output = f"... (обрезано)\n{output[-max_len:]}"
-
-    # Подсвечиваем ошибки
-    output = highlight_errors(output)
-
-    # Определяем состояние сессии для дополнительного контекста
+    # Состояние определяем ДО подсветки (иначе ❌-префиксы путают детектор)
     state = detect_session_state(output)
     state_hint = {
-        "prompt": " 💬 (ожидает ввода: y/n)",
-        "build": " 🔨 (идёт сборка...)",
-        "running": " ⚡ (выполняется...)",
-        "error": " 🚨 (обнаружена ошибка!)",
+        "prompt": " 💬 ждёт ответа",
+        "build": " 🔨 сборка…",
+        "running": " ⚡ выполняется…",
+        "error": " 🚨 ошибка",
         "idle": "",
     }.get(state, "")
 
+    # Ограничиваем длину (лимит VK 4096, оставляем запас)
+    if len(output) > max_len:
+        output = f"…(обрезано)\n{output[-max_len:]}"
+
+    output = highlight_errors(output)
     header = f"📺 {session_name}{state_hint}"
-    sep = "─" * 38
-    return f"{header}\n{sep}\n{output}\n{sep}"
+    return f"{header}\n{'━' * 22}\n{output}"
 
 
 class VkTmuxBot:
@@ -389,6 +404,14 @@ class VkTmuxBot:
             self._delete_msg(peer_id, msg_id)
             return
 
+        # «//команда» → слэш-команда уходит В СЕССИЮ (например //model в Claude),
+        # а не боту. Работает только в активной сессии с доступом.
+        if text.startswith("//") and self._get_session(user_id) and self._can_tmux(user_id):
+            self.vk.set_typing(peer_id)
+            self._send_as_command(peer_id, user_id, text[1:])  # шлём "/model"
+            self._delete_msg(peer_id, msg_id)
+            return
+
         # Команды
         if text.startswith("/"):
             parts = text.split(maxsplit=1)
@@ -446,6 +469,9 @@ class VkTmuxBot:
         "unwatch", "стоп", "s", "send", "отправить", "e", "enter", "c", "d",
         "session", "сессия", "detach", "откл", "claude", "клод", "dcc", "дкк",
         "in", "через", "at", "в", "tasks", "задачи", "cancel", "отмена",
+        # клавиши пульта
+        "up", "down", "left", "right", "esc", "escape", "tab", "btab",
+        "space", "bspace", "pgup", "pgdn", "home", "end",
     }
     _ADMIN_CMDS = {"admin", "админ", "users", "adduser", "grant", "revoke"}
 
@@ -481,6 +507,21 @@ class VkTmuxBot:
             # Меню
             "menu": self._cmd_menu,
             "меню": self._cmd_menu,
+            # Клавиши пульта (тихие — watch показывает результат)
+            "up": lambda p, u, a: self._send_session_key(p, u, "up"),
+            "down": lambda p, u, a: self._send_session_key(p, u, "down"),
+            "left": lambda p, u, a: self._send_session_key(p, u, "left"),
+            "right": lambda p, u, a: self._send_session_key(p, u, "right"),
+            "esc": lambda p, u, a: self._send_session_key(p, u, "esc"),
+            "escape": lambda p, u, a: self._send_session_key(p, u, "esc"),
+            "tab": lambda p, u, a: self._send_session_key(p, u, "tab"),
+            "btab": lambda p, u, a: self._send_session_key(p, u, "btab"),
+            "space": lambda p, u, a: self._send_session_key(p, u, "space"),
+            "bspace": lambda p, u, a: self._send_session_key(p, u, "bspace"),
+            "pgup": lambda p, u, a: self._send_session_key(p, u, "pgup"),
+            "pgdn": lambda p, u, a: self._send_session_key(p, u, "pgdn"),
+            "home": lambda p, u, a: self._send_session_key(p, u, "home"),
+            "end": lambda p, u, a: self._send_session_key(p, u, "end"),
             # Сессии
             "ls": self._cmd_ls,
             "sessions": self._cmd_ls,
@@ -715,15 +756,20 @@ class VkTmuxBot:
 {tg_help}
 
 ━━━━━━━━━━━━━━━━━━
-🖥 СЕССИИ TMUX
-  /ls — список (тап = подключиться + лента)
+🖥 СЕССИИ TMUX / CLAUDE CODE
+  /ls — список (тап = подключиться + пульт)
   /new <имя> [команда] — создать (+ запуск)
   /claude — Claude Code · /dcc — DeepClaude
   /attach · /kill · /detach
-  /o — вывод · /watch — автообновление
 
-⌨️ Ввод: просто пиши (вне TG-чата)
-  /e — Enter · /c — Ctrl+C · /d — Ctrl+D
+🎮 Пульт (кнопки под выводом): стрелки ⬆⬇⬅➡,
+  ⏎ Enter, ⎋ Esc, ⇥ Tab, ⇧⇥ Shift+Tab, ⛔ Ctrl+C
+  — навигация по меню Claude (/resume, /model и т.п.)
+
+⌨️ Ввод в сессию (когда подключён):
+  • просто пиши текст → уходит в сессию
+  • //model, //resume — слэш-команды В Claude
+    (одиночный / — это команды бота)
 
 ━━━━━━━━━━━━━━━━━━
 ⏰ ПЛАНИРОВЩИК
@@ -1038,43 +1084,68 @@ class VkTmuxBot:
             self._del_session(user_id)
             return
 
+        # При активном watch подтверждение не шлём — лента сама покажет ввод
+        watching = self._get_watch(user_id) is not None
         # Короткий текст — сразу с Enter, длинный — сначала текст
         if len(text) <= 80:
             if send_keys(session, text, press_enter=True):
-                self.vk.send_message(peer_id, f"✅ {text[:100]}")
+                if not watching:
+                    self.vk.send_message(peer_id, f"✅ {text[:100]}")
             else:
                 self.vk.send_message(peer_id, "❌ Не удалось отправить команду.")
         else:
             if send_keys(session, text, press_enter=False):
-                self.vk.send_message(peer_id, f"✅ Текст отправлен: {text[:80]}…")
                 time.sleep(0.3)
-                if send_keys(session, "", press_enter=True):
-                    self.vk.send_message(peer_id, "✅ Enter")
-                else:
-                    self.vk.send_message(peer_id, "⚠️ Enter не отправлен — /e вручную")
+                send_keys(session, "", press_enter=True)
+                if not watching:
+                    self.vk.send_message(peer_id, f"✅ {text[:80]}…")
             else:
                 self.vk.send_message(peer_id, "❌ Не удалось отправить команду.")
 
-    def _cmd_enter(self, peer_id, user_id, args):
-        """Нажать Enter в сессии."""
+    # tmux-имена клавиш для пульта управления
+    _KEY_MAP = {
+        "e": "Enter", "enter": "Enter",
+        "esc": "Escape", "escape": "Escape",
+        "tab": "Tab", "btab": "BTab",
+        "up": "Up", "down": "Down", "left": "Left", "right": "Right",
+        "space": "Space", "bspace": "BSpace",
+        "pgup": "PageUp", "pgdn": "PageDown", "home": "Home", "end": "End",
+    }
+
+    def _send_session_key(self, peer_id, user_id, cmd):
+        """Отправить именованную клавишу в сессию (ТИХО — watch покажет результат)."""
         session = self._get_session(user_id)
         if not session:
-            self.vk.send_message(peer_id, "⚠️ Нет активной сессии.")
+            self.vk.send_message(peer_id, "⚠️ Нет активной сессии. /ls")
             return
-        if send_keys(session, "", press_enter=True):
-            self.vk.send_message(peer_id, "✅ Enter")
-        else:
-            self.vk.send_message(peer_id, "❌ Не удалось отправить Enter.")
+        key = self._KEY_MAP.get(cmd)
+        if not key:
+            return
+        self.vk.set_typing(peer_id)
+        ok = send_control_key(session, key)
+        # Если watch не активен — подтверждаем разово (иначе молчим, лента обновится)
+        if ok and not self._get_watch(user_id):
+            self.vk.send_message(peer_id, f"✅ {key}")
+        elif not ok:
+            self.vk.send_message(peer_id, f"❌ Не удалось отправить {key}")
+
+    def _cmd_enter(self, peer_id, user_id, args):
+        self._send_session_key(peer_id, user_id, "e")
+
+    def _cmd_key(self, peer_id, user_id, args, _cmd):
+        self._send_session_key(peer_id, user_id, _cmd)
 
     def _cmd_ctrl_c(self, peer_id, user_id, args):
-        """Ctrl+C в сессии."""
+        """Ctrl+C в сессии (тихо при watch)."""
         session = self._get_session(user_id)
         if not session:
             self.vk.send_message(peer_id, "⚠️ Нет активной сессии.")
             return
-        if send_control_key(session, "C-c"):
+        self.vk.set_typing(peer_id)
+        ok = send_control_key(session, "C-c")
+        if ok and not self._get_watch(user_id):
             self.vk.send_message(peer_id, "⛔ Ctrl+C")
-        else:
+        elif not ok:
             self.vk.send_message(peer_id, "❌ Не удалось отправить Ctrl+C.")
 
     def _cmd_ctrl_d(self, peer_id, user_id, args):
@@ -1083,10 +1154,8 @@ class VkTmuxBot:
         if not session:
             self.vk.send_message(peer_id, "⚠️ Нет активной сессии.")
             return
-        if send_control_key(session, "C-d"):
+        if send_control_key(session, "C-d") and not self._get_watch(user_id):
             self.vk.send_message(peer_id, "🚪 Ctrl+D")
-        else:
-            self.vk.send_message(peer_id, "❌ Не удалось отправить Ctrl+D.")
 
     def _cmd_session(self, peer_id, user_id, args):
         """Показать текущую сессию."""
@@ -1211,9 +1280,10 @@ class VkTmuxBot:
                   "/adduser <vk_id> [имя] — добавить (Telegram)",
                   "/grant <vk_id> — выдать доступ к серверу",
                   "/revoke <vk_id> — забрать доступ к серверу"]
-        kb = make_keyboard([[
-            {"label": "➕ Добавить юзера", "color": "positive", "payload": "/adduser"},
-        ]], one_time=False)
+        kb = make_keyboard([
+            [{"label": "➕ Добавить юзера", "color": "positive", "payload": "/adduser"}],
+            [{"label": "🏠 Главное меню", "color": "primary", "payload": "/menu"}],
+        ], one_time=False)
         self.vk.send_message(peer_id, "\n".join(lines), keyboard=kb)
 
     def _cmd_adduser(self, peer_id, user_id, args):

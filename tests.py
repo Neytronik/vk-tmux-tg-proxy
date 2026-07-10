@@ -675,13 +675,23 @@ class TestOutputFormatting(unittest.TestCase):
         self.assertIn("📺 test", result)
         self.assertIn("line1", result)
         self.assertIn("line2", result)
-        self.assertIn("─" * 38, result)
+        self.assertIn("━" * 22, result)
 
     def test_format_output_empty(self):
         """Форматирование пустого вывода."""
         from vkbot.bot import format_output
         result = format_output("empty", "")
-        self.assertIn("пустой вывод", result)
+        self.assertIn("пусто", result)
+
+    def test_clean_pane_strips_trailing(self):
+        """Хвостовые пробелы (padding tmux) убираются."""
+        from vkbot.bot import _clean_pane
+        out = _clean_pane("hello     \nworld   \n\n\n\nend")
+        # нет строк с хвостовыми пробелами
+        for ln in out.split("\n"):
+            self.assertEqual(ln, ln.rstrip())
+        # 3+ пустых схлопнуты
+        self.assertNotIn("\n\n\n", out)
 
     def test_format_output_truncation(self):
         """Обрезание длинного вывода."""
