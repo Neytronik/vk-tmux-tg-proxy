@@ -526,7 +526,9 @@ class TestVkKeyboards(unittest.TestCase):
             for btn in row:
                 labels.append(btn["action"]["label"])
         self.assertIn("⛔ Ctrl+C", labels)
-        self.assertIn("🛑 Стоп", labels)
+        self.assertIn("🔽 Свернуть", labels)      # свернуть — сессия живёт
+        self.assertIn("❌ Завершить", labels)      # завершить — с подтверждением
+        self.assertIn("⚡ Быстрые", labels)         # быстрые команды (паритет с TG)
         self.assertIn("🔄 Обновить", labels)
 
     def test_notify_keyboard(self):

@@ -513,11 +513,29 @@ def make_watch_keyboard():
             {"label": "⛔ Ctrl+C", "color": NEGATIVE, "payload": "/c"},
         ],
         [
+            {"label": "📝 Текст", "color": SECONDARY, "payload": "/s"},
+            {"label": "⚡ Быстрые", "color": SECONDARY, "payload": "/quick"},
             {"label": "🔄 Обновить", "color": PRIMARY, "payload": "/o"},
+        ],
+        [
             {"label": "🏠 Меню", "color": PRIMARY, "payload": "/menu"},
-            {"label": "🛑 Стоп", "color": NEGATIVE, "payload": "/unwatch"},
+            {"label": "🔽 Свернуть", "color": SECONDARY, "payload": "/unwatch"},
+            {"label": "❌ Завершить", "color": NEGATIVE, "payload": "/killcur"},
         ],
     ], one_time=False)
+
+
+def make_quick_keyboard(quick_commands):
+    """Быстрые команды во время сессии — тап отправляет команду и возвращает пульт."""
+    buttons, row = [], []
+    for i, c in enumerate(quick_commands):
+        row.append({"label": c[:20], "color": SECONDARY, "payload": f"/qrun {i}"})
+        if len(row) == 2:
+            buttons.append(row); row = []
+    if row:
+        buttons.append(row)
+    buttons.append([{"label": "⬅ К сессии", "color": PRIMARY, "payload": "/watch"}])
+    return make_keyboard(buttons, one_time=False)
 
 
 def make_notify_keyboard(current_state):

@@ -20,6 +20,7 @@ from .vk_api import (
     make_sessions_keyboard,
     make_kill_keyboard,
     make_kill_confirm_keyboard,
+    make_quick_keyboard,
     make_watch_keyboard,
     make_notify_keyboard,
 )
@@ -435,7 +436,8 @@ class VkTmuxBot:
     # Команды управления сервером — только для админа / пользователей с tmux-доступом
     _SERVER_CMDS = {
         "ls", "sessions", "сессии", "new", "новая", "run", "attach", "подключить",
-        "kill", "удалить", "delete", "killask", "o", "output", "вывод", "watch", "смотреть",
+        "kill", "удалить", "delete", "killask", "killcur", "quick", "быстрые", "qrun",
+        "o", "output", "вывод", "watch", "смотреть",
         "unwatch", "стоп", "s", "send", "отправить", "e", "enter", "c", "d",
         "session", "сессия", "detach", "откл", "claude", "клод", "dcc", "дкк",
         "in", "через", "at", "в", "tasks", "задачи", "cancel", "отмена",
@@ -506,6 +508,10 @@ class VkTmuxBot:
             "удалить": self._cmd_kill,
             "delete": self._cmd_kill,
             "killask": self._cmd_killask,
+            "killcur": self._cmd_killcur,
+            "quick": self._cmd_quick_vk,
+            "быстрые": self._cmd_quick_vk,
+            "qrun": self._cmd_qrun,
             "session": self._cmd_session,
             "сессия": self._cmd_session,
             "detach": self._cmd_detach,
@@ -933,6 +939,42 @@ class VkTmuxBot:
             f"⚠️ Завершить сессию «{name}»?\nЭто необратимо — процессы внутри остановятся.",
             keyboard=make_kill_confirm_keyboard(name))
 
+    def _cmd_killcur(self, peer_id, user_id, args):
+        """Завершить ТЕКУЩУЮ активную сессию — через подтверждение."""
+        name = self._get_session(user_id)
+        if not name or not session_exists(name):
+            self.vk.send_message(peer_id, "⚠️ Нет активной сессии.")
+            return
+        self._cmd_killask(peer_id, user_id, name)
+
+    def _cmd_quick_vk(self, peer_id, user_id, args):
+        """Показать быстрые команды для активной сессии."""
+        if not self._get_session(user_id):
+            self.vk.send_message(peer_id, "⚠️ Сначала подключитесь к сессии (/ls).")
+            return
+        cmds = self.config["tmux"].get("quick_commands", [])
+        if not cmds:
+            self.vk.send_message(peer_id, "Быстрые команды не настроены (tmux.quick_commands).")
+            return
+        self.vk.send_message(peer_id, "⚡ Быстрые команды — тап отправит в сессию:",
+                             keyboard=make_quick_keyboard(cmds))
+
+    def _cmd_qrun(self, peer_id, user_id, args):
+        """Выполнить быструю команду по индексу и вернуться к пульту сессии."""
+        cmds = self.config["tmux"].get("quick_commands", [])
+        try:
+            cmd = cmds[int((args or "").strip())]
+        except (ValueError, IndexError):
+            self._cmd_quick_vk(peer_id, user_id, "")
+            return
+        self._send_text(peer_id, user_id, cmd)
+        # Возвращаем пульт (нижняя клавиатура была заменена на «Быстрые»).
+        # Если watch не активен — включим его, чтобы видеть результат.
+        if self._get_watch(user_id):
+            self.vk.send_message(peer_id, f"⚡ {cmd[:60]}", keyboard=make_watch_keyboard())
+        else:
+            self._cmd_watch(peer_id, user_id, "")
+
     def _cmd_kill(self, peer_id, user_id, args):
         """Удалить сессию."""
         sessions = list_sessions()
@@ -1056,7 +1098,13 @@ class VkTmuxBot:
         self._watch_threads.pop(user_id, None)  # иначе повторный /watch не стартует
         self._save_state()
 
-        self.vk.send_message(peer_id, "✅ Режим наблюдения остановлен.")
+        # Возвращаем главное меню, иначе старый пульт сессии «висит»
+        session = self._get_session(user_id)
+        kb = make_main_keyboard(session, is_admin=self._is_admin(user_id),
+                                has_projects=bool(self._projects()))
+        hint = f"⏸ Слежение выключено. Сессия «{session}» жива." if session \
+            else "⏸ Слежение выключено."
+        self.vk.send_message(peer_id, hint, keyboard=kb)
         print(f"👁 user={user_id} остановил watch")
 
     def _cmd_send(self, peer_id, user_id, args):
