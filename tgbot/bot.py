@@ -387,6 +387,19 @@ class TgTmuxBot:
             if chat_id in self.streams:
                 self.streams[chat_id]["kb_mode"] = "pad"
                 self._rerender_stream(chat_id)
+        elif data == "sessmenu":
+            if chat_id in self.streams:
+                self.streams[chat_id]["kb_mode"] = "sessmenu"
+                self._rerender_stream(chat_id)
+        elif data == "killcur":
+            # Первый шаг подтверждения (кнопки на том же сообщении)
+            if chat_id in self.streams:
+                self.streams[chat_id]["kb_mode"] = "killconfirm"
+                self._rerender_stream(chat_id)
+            else:
+                self._kill_current(chat_id, edit=mid)
+        elif data == "killyes":
+            self._kill_current(chat_id, edit=mid)
         elif data.startswith("q:"):
             self._run_quick(chat_id, data[2:])
         elif data.startswith("cancel:"):
@@ -833,13 +846,42 @@ class TgTmuxBot:
         # Всегда показываем ОБНОВЛЁННЫЙ экран управления (не застрявшие кнопки)
         self._cmd_manage(chat_id, edit=edit)
 
+    def _kill_current(self, chat_id, edit=None):
+        """Завершить (убить) активную сессию текущего чата и вернуться в меню."""
+        name = self.sessions.get(chat_id)
+        st = self.streams.get(chat_id)
+        mid = edit or (st.get("msg_id") if st else None)
+        self._stop_stream(chat_id)
+        self.sessions.pop(chat_id, None)
+        self._save_sessions()
+        if name and session_exists(name):
+            kill_session(name)
+        txt = f"❌ Сессия «{name}» завершена." if name else "Сессия не выбрана."
+        self._screen(chat_id, txt, keyboard=self._menu_kb(), edit=mid)
+
     def _pad_kb(self):
         return ikb([
             [("⬆️", "k:up"), ("⏎", "k:e"), ("⎋ Esc", "k:esc")],
             [("⬅️", "k:left"), ("⬇️", "k:down"), ("➡️", "k:right")],
             [("⇥ Tab", "k:tab"), ("⇧⇥", "k:btab"), ("⛔ Ctrl+C", "k:c")],
             [("📝 Текст", "input"), ("⚡ Быстрые", "quick"), ("🔄", "o")],
-            [("🖥 Сессии", "ls"), ("🔌 Откл", "detach"), ("🛑 Стоп", "stop")],
+            # Свернуть = уйти, сессия ЖИВЁТ. Завершение спрятано в «⚙️ Ещё».
+            [("🖥 Сессии", "ls"), ("🔽 Свернуть", "detach"), ("⚙️ Ещё", "sessmenu")],
+        ])
+
+    def _sessmenu_kb(self):
+        """Подменю действий над сессией — здесь живёт опасное «Завершить»
+        (спрятано от случайного клика в пульте)."""
+        return ikb([
+            [("❌ Завершить сессию", "killcur")],
+            [("⬅ Клавиши", "padmode")],
+        ])
+
+    def _killconfirm_kb(self):
+        """Явное подтверждение завершения — второй шаг, на том же сообщении."""
+        return ikb([
+            [("❌ Да, завершить сессию", "killyes")],
+            [("⬅ Отмена, вернуться", "sessmenu")],
         ])
 
     def _quick_inline_kb(self):
@@ -857,10 +899,15 @@ class TgTmuxBot:
         return ikb(rows)
 
     def _stream_kb(self, chat_id):
-        """Клавиатура для сообщения-стрима по текущему режиму (пульт/быстрые)."""
+        """Клавиатура для сообщения-стрима по текущему режиму."""
         st = self.streams.get(chat_id)
-        if st and st.get("kb_mode") == "quick":
+        mode = st.get("kb_mode") if st else "pad"
+        if mode == "quick":
             return self._quick_inline_kb()
+        if mode == "sessmenu":
+            return self._sessmenu_kb()
+        if mode == "killconfirm":
+            return self._killconfirm_kb()
         return self._pad_kb()
 
     def _rerender_stream(self, chat_id):

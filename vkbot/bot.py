@@ -19,6 +19,7 @@ from .vk_api import (
     make_tg_menu_keyboard,
     make_sessions_keyboard,
     make_kill_keyboard,
+    make_kill_confirm_keyboard,
     make_watch_keyboard,
     make_notify_keyboard,
 )
@@ -434,7 +435,7 @@ class VkTmuxBot:
     # Команды управления сервером — только для админа / пользователей с tmux-доступом
     _SERVER_CMDS = {
         "ls", "sessions", "сессии", "new", "новая", "run", "attach", "подключить",
-        "kill", "удалить", "delete", "o", "output", "вывод", "watch", "смотреть",
+        "kill", "удалить", "delete", "killask", "o", "output", "вывод", "watch", "смотреть",
         "unwatch", "стоп", "s", "send", "отправить", "e", "enter", "c", "d",
         "session", "сессия", "detach", "откл", "claude", "клод", "dcc", "дкк",
         "in", "через", "at", "в", "tasks", "задачи", "cancel", "отмена",
@@ -504,6 +505,7 @@ class VkTmuxBot:
             "kill": self._cmd_kill,
             "удалить": self._cmd_kill,
             "delete": self._cmd_kill,
+            "killask": self._cmd_killask,
             "session": self._cmd_session,
             "сессия": self._cmd_session,
             "detach": self._cmd_detach,
@@ -919,6 +921,17 @@ class VkTmuxBot:
             self._watch_threads.pop(user_id, None)
         self._cmd_watch(peer_id, user_id, "")
         print(f"✅ user={user_id} подключился к: {name}")
+
+    def _cmd_killask(self, peer_id, user_id, args):
+        """Спросить подтверждение перед удалением сессии (защита от случайного клика)."""
+        name = (args or "").strip()
+        if not name or not session_exists(name):
+            self._cmd_kill(peer_id, user_id, "")
+            return
+        self.vk.send_message(
+            peer_id,
+            f"⚠️ Завершить сессию «{name}»?\nЭто необратимо — процессы внутри остановятся.",
+            keyboard=make_kill_confirm_keyboard(name))
 
     def _cmd_kill(self, peer_id, user_id, args):
         """Удалить сессию."""
@@ -2007,7 +2020,11 @@ class VkTmuxBot:
                 buttons.append(extra)
                 wsec = self.tg_watch_cfg.get(user_id, 0)
                 wlabel = f"🔔 Уведомл. ({wsec}с)" if wsec else "🔔 Уведомления"
-                buttons.append([{"label": wlabel, "color": "secondary", "payload": "/tg watch"}])
+                wrow = [{"label": wlabel, "color": "secondary", "payload": "/tg watch"}]
+                # Админам (есть доступ к серверу) — выход в главное меню сервера
+                if self._can_tmux(user_id):
+                    wrow.append({"label": "🏠 Меню", "color": "primary", "payload": "/menu"})
+                buttons.append(wrow)
 
                 kb = make_keyboard(buttons, one_time=False)
                 # Сохраняем folders в state (для фильтра по папке при пагинации)
@@ -2192,6 +2209,10 @@ class VkTmuxBot:
         back_btn = ({"label": "⬅ К топикам", "color": "primary", "payload": f"/tg topics {chat_id}"}
                     if topic_id else
                     {"label": "⬅ К чатам", "color": "primary", "payload": "/tg back"})
+        last_row = [{"label": "🔍 Поиск", "color": "secondary", "payload": "/tg find"}]
+        # Админам — выход в главное меню сервера прямо из диалога
+        if self._can_tmux(user_id):
+            last_row.append({"label": "🏠 Меню", "color": "primary", "payload": "/menu"})
         return make_keyboard([
             [
                 back_btn,
@@ -2201,9 +2222,7 @@ class VkTmuxBot:
                 mute_btn,
                 {"label": "🔴 Непрочитанные", "color": "secondary", "payload": "/tg unread"},
             ],
-            [
-                {"label": "🔍 Поиск", "color": "secondary", "payload": "/tg find"},
-            ],
+            last_row,
         ], one_time=False)
 
     def _maybe_transcribe(self, peer_id, mid, media):

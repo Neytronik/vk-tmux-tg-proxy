@@ -496,15 +496,27 @@ class TestVkKeyboards(unittest.TestCase):
         self.assertIn("🏠 Меню", labels)
 
     def test_kill_keyboard(self):
-        """Клавиатура удаления."""
+        """Клавиатура удаления: тап ведёт на подтверждение (/killask), не сразу /kill."""
         kb = make_kill_keyboard(["a", "b"])
-        labels = []
+        labels, payloads = [], []
         for row in kb["buttons"]:
             for btn in row:
                 labels.append(btn["action"]["label"])
+                payloads.append(btn["action"].get("payload", ""))
         self.assertIn("🗑 a", labels)
         self.assertIn("🗑 b", labels)
-        self.assertFalse(kb["one_time"])  # консистентно с остальными меню
+        # безопасность: список НЕ содержит прямых /kill — только /killask
+        self.assertTrue(any("/killask a" in p for p in payloads))
+        self.assertFalse(any(p.strip() == "/kill a" for p in payloads))
+        self.assertFalse(kb["one_time"])
+
+    def test_kill_confirm_keyboard(self):
+        """Подтверждение удаления: есть явное «Да» (/kill name) и отмена (/kill)."""
+        from vkbot.vk_api import make_kill_confirm_keyboard
+        kb = make_kill_confirm_keyboard("mysess")
+        payloads = [b["action"].get("payload", "") for row in kb["buttons"] for b in row]
+        self.assertTrue(any("/kill mysess" in p for p in payloads))   # явное «Да»
+        self.assertTrue(any('"/kill"' in p for p in payloads))        # отмена → к списку
 
     def test_watch_keyboard(self):
         """Клавиатура watch mode."""

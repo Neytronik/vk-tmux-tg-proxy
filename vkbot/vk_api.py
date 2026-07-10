@@ -461,14 +461,15 @@ def make_sessions_keyboard(sessions, current=None):
 
 
 def make_kill_keyboard(sessions):
-    """Клавиатура для выбора сессии на удаление (с выходом — без тупика)."""
+    """Клавиатура выбора сессии на удаление. Тап → экран подтверждения
+    (не убиваем сразу — случайный клик не должен завершить сессию)."""
     buttons = []
     row = []
     for s in sessions:
         row.append({
             "label": f"🗑 {s}",
             "color": NEGATIVE,
-            "payload": f"/kill {s}",
+            "payload": f"/killask {s}",   # сначала подтверждение
         })
         if len(row) == 2:
             buttons.append(row)
@@ -481,6 +482,15 @@ def make_kill_keyboard(sessions):
         {"label": "🏠 Меню", "color": PRIMARY, "payload": "/menu"},
     ])
     return make_keyboard(buttons, one_time=False)
+
+
+def make_kill_confirm_keyboard(name):
+    """Явное подтверждение удаления конкретной сессии."""
+    return make_keyboard([
+        [{"label": f"❌ Да, завершить «{name}»"[:40], "color": NEGATIVE,
+          "payload": f"/kill {name}"}],
+        [{"label": "⬅ Отмена", "color": SECONDARY, "payload": "/kill"}],
+    ], one_time=False)
 
 
 def make_watch_keyboard():
