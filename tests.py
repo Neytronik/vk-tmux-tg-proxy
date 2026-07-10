@@ -810,6 +810,16 @@ class TestTgBot(unittest.TestCase):
         self.assertEqual(KEY_MAP["btab"], "BTab")
         self.assertEqual(KEY_MAP["esc"], "Escape")
 
+    def test_proxy_wiring(self):
+        """Прокси из конфига попадает в сессию и не тянется из окружения."""
+        from tgbot.api import TgBotApi
+        a = TgBotApi("1:fake", proxy="http://user:pass@host:3128")
+        self.assertEqual(a._session.proxies.get("https"), "http://user:pass@host:3128")
+        self.assertFalse(a._session.trust_env)  # поведение только от конфига
+        b = TgBotApi("1:fake")  # без прокси
+        self.assertFalse(b._session.proxies.get("https"))
+        self.assertFalse(b._session.trust_env)
+
     def test_strip_volatile_ignores_spinner_and_timer(self):
         """Анимация спиннера и счётчик «esc to interrupt (12s)» не считаются
         изменением — иначе поток правок затопит Telegram и словит 429/зависание."""

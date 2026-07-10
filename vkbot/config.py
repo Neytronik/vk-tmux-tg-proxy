@@ -55,6 +55,10 @@ DEFAULT_CONFIG = {
         "bot_token": "",             # токен от @BotFather
         "admin_ids": [],             # кто управляет сервером (первый — админ)
         "allowed_user_ids": [],      # кому разрешён бот
+        "proxy": "",                 # прокси для Telegram, если он заблокирован
+                                     # (напр. http://user:pass@host:port или "env"
+                                     #  чтобы взять из https_proxy). Пусто = напрямую.
+                                     # Касается ТОЛЬКО Telegram-бота, не VK.
     },
 }
 

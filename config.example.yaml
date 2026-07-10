@@ -69,3 +69,9 @@ tgbot:
     - 123456789                 # ← ваш Telegram ID (узнать: @userinfobot)
   allowed_user_ids:
     - 123456789
+  # Прокси, если Telegram заблокирован в вашей сети (напр. в РФ).
+  # Касается ТОЛЬКО Telegram-бота — VK-бот работает напрямую.
+  # Форматы: http://user:pass@host:port  ·  socks5://host:port  ·
+  #          "env" — взять из переменной окружения https_proxy.
+  # Пусто — ходить в Telegram напрямую.
+  proxy: ""

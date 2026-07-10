@@ -23,7 +23,7 @@ class TgBotError(Exception):
 class TgBotApi:
     """Клиент Telegram Bot API."""
 
-    def __init__(self, token, rate_limit_delay=0.05):
+    def __init__(self, token, rate_limit_delay=0.05, proxy=None):
         self.token = token
         self.base = f"https://api.telegram.org/bot{token}"
         self.rate_limit_delay = rate_limit_delay
@@ -34,6 +34,12 @@ class TgBotApi:
         self._session = requests.Session()
         adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=8)
         self._session.mount("https://", adapter)
+        # Прокси (только для этого клиента Telegram) — адрес приходит из
+        # конфига, нигде не зашит. requests сам туннелирует https через CONNECT.
+        # Поведение зависит ТОЛЬКО от конфига, не от случайных env процесса.
+        self._session.trust_env = False
+        if proxy:
+            self._session.proxies = {"http": proxy, "https": proxy}
 
     def _rate_limit(self):
         with self._lock:

@@ -183,7 +183,16 @@ class TgTmuxBot:
             print("❌ Не указан tgbot.bot_token.")
             return False
 
-        self.api = TgBotApi(token)
+        # Прокси только для Telegram-бота (Telegram может быть заблокирован в РФ).
+        # Значение "env" — взять из https_proxy/HTTPS_PROXY окружения.
+        proxy = (tg.get("proxy") or "").strip()
+        if proxy.lower() == "env":
+            import os
+            proxy = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY") or ""
+        if proxy:
+            print("🌐 Telegram Bot API через прокси (адрес скрыт)")
+
+        self.api = TgBotApi(token, proxy=proxy or None)
         ok, info = self.api.validate()
         print(f"🔍 Бот: {info}")
         if not ok:
