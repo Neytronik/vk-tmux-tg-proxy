@@ -771,6 +771,45 @@ class TestConfig(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class TestTgBot(unittest.TestCase):
+    """Тесты Telegram-бота (общие хелперы, рендер, клавиатуры)."""
+
+    def test_ikb_structure(self):
+        from tgbot.api import ikb
+        kb = ikb([[("A", "a"), ("B", "b")], [("C", "c")]])
+        self.assertIn("inline_keyboard", kb)
+        self.assertEqual(len(kb["inline_keyboard"]), 2)
+        self.assertEqual(kb["inline_keyboard"][0][0]["text"], "A")
+        self.assertEqual(kb["inline_keyboard"][0][0]["callback_data"], "a")
+
+    def test_pre_block_escapes(self):
+        from tgbot.api import pre_block
+        r = pre_block("a < b & c > d")
+        self.assertTrue(r.startswith("<pre>") and r.endswith("</pre>"))
+        self.assertIn("&lt;", r)
+        self.assertIn("&amp;", r)
+        self.assertNotIn("< b", r)  # экранировано
+
+    def test_fmt_stream_monospace(self):
+        from tgbot.bot import fmt_stream
+        r = fmt_stream("mysess", "line1\nline2   \n\n\n\nline3")
+        self.assertIn("mysess", r)
+        self.assertIn("<pre>", r)
+        # хвостовые пробелы убраны
+        self.assertNotIn("line2   ", r)
+
+    def test_fmt_stream_empty(self):
+        from tgbot.bot import fmt_stream
+        r = fmt_stream("s", "")
+        self.assertIn("пусто", r)
+
+    def test_key_map(self):
+        from tgbot.bot import KEY_MAP
+        self.assertEqual(KEY_MAP["up"], "Up")
+        self.assertEqual(KEY_MAP["btab"], "BTab")
+        self.assertEqual(KEY_MAP["esc"], "Escape")
+
+
 # ── Запуск ────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

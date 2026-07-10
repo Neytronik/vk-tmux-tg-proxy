@@ -33,6 +33,8 @@ DEFAULT_CONFIG = {
         "idle_notify_minutes": 10,   # тишина N минут → уведомление «сессия остановилась»
         "term_width": 62,            # ширина терминала — узкая, чтобы TUI Claude
         "term_height": 40,           # помещался в чат и не «ехал»
+        # Быстрые команды — кнопки для частых действий в терминальной сессии
+        "quick_commands": ["ls -la", "git status", "clear", "htop", "pwd", "df -h"],
     },
     "claude": {
         "command": "claude",         # команда запуска Claude Code

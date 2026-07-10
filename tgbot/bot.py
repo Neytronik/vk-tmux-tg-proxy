@@ -258,15 +258,23 @@ class TgTmuxBot:
             self._cmd_tasks(chat_id)
         elif data == "stop":
             self._stop_stream(chat_id)
-            self.api.send(chat_id, "🛑 Стрим остановлен.")
+            self.api.send(chat_id, "🛑 Стрим остановлен.", keyboard=self._menu_kb())
         elif data == "o":
             self._refresh_stream(chat_id)
+        elif data == "manage":
+            self._cmd_manage(chat_id)
+        elif data == "quick":
+            self._cmd_quick(chat_id)
+        elif data == "detach":
+            self._detach(chat_id)
         elif data.startswith("open:"):
             self._attach_and_stream(chat_id, data[5:])
         elif data.startswith("kill:"):
             self._kill(chat_id, data[5:])
         elif data.startswith("k:"):
             self._send_key(chat_id, data[2:])
+        elif data.startswith("q:"):
+            self._run_quick(chat_id, data[2:])
         elif data == "input":
             self.pending[chat_id] = "send"
             self.api.send(chat_id, "📝 Текст для отправки в сессию:")
@@ -280,6 +288,10 @@ class TgTmuxBot:
             self._cmd_menu(chat_id)
         elif cmd in ("ls", "sessions", "сессии"):
             self._cmd_ls(chat_id)
+        elif cmd in ("manage", "управление"):
+            self._cmd_manage(chat_id)
+        elif cmd in ("quick", "быстрые"):
+            self._cmd_quick(chat_id)
         elif cmd in ("new", "новая"):
             if args.strip():
                 self._create_and_open(chat_id, args.strip().split()[0], args)
@@ -365,19 +377,62 @@ class TgTmuxBot:
     def _cmd_menu(self, chat_id):
         self.api.send(chat_id, "⚡ Главное меню — выберите действие:", keyboard=self._menu_kb())
 
+    _STATUS_ICON = {"prompt": "💬", "build": "🔨", "running": "⚡", "error": "🚨", "idle": "🟢"}
+
+    def _session_status(self, name):
+        """Иконка состояния сессии (быстрый взгляд на список)."""
+        try:
+            out = get_output(name, 25)
+            return self._STATUS_ICON.get(detect_session_state(out), "🟢")
+        except Exception:
+            return "•"
+
     def _cmd_ls(self, chat_id):
         sessions = list_sessions()
         cur = self.sessions.get(chat_id)
         if not sessions:
-            self.api.send(chat_id, "Нет сессий. Создайте новую:", keyboard=ikb([
-                [("➕ Новая", "new"), ("🤖 Claude", "claude")]]))
+            self.api.send(chat_id, "📭 Активных сессий нет.\nСоздайте новую или запустите Claude:",
+                          keyboard=ikb([[("➕ Новая", "new"), ("🤖 Claude", "claude")],
+                                        [("🏠 Меню", "menu")]]))
             return
         rows = []
         for s in sessions:
             mark = "▶ " if s == cur else ""
-            rows.append([(f"{mark}📺 {s}", f"open:{s}")])
-        rows.append([("➕ Новая", "new"), ("🏠 Меню", "menu")])
-        self.api.send(chat_id, f"🖥 Сессии ({len(sessions)}). Тап — подключиться:", keyboard=ikb(rows))
+            st = self._session_status(s)
+            rows.append([(f"{mark}{st} {s}", f"open:{s}")])
+        rows.append([("➕ Новая", "new"), ("🗑 Управление", "manage")])
+        rows.append([("🏠 Меню", "menu")])
+        self.api.send(chat_id,
+                      f"🖥 <b>Сессии</b> ({len(sessions)}) — тап, чтобы подключиться:\n"
+                      f"🟢 готова · ⚡ работает · 💬 ждёт · 🚨 ошибка",
+                      keyboard=ikb(rows), html_mode=True)
+
+    def _cmd_manage(self, chat_id):
+        """Экран управления: удаление сессий (с выходом — без тупика)."""
+        sessions = list_sessions()
+        if not sessions:
+            self._cmd_ls(chat_id)
+            return
+        rows = [[(f"🗑 {s}", f"kill:{s}")] for s in sessions]
+        rows.append([("⬅ К сессиям", "ls"), ("🏠 Меню", "menu")])
+        self.api.send(chat_id, "🗑 Тап — удалить сессию:", keyboard=ikb(rows))
+
+    def _cmd_quick(self, chat_id):
+        """Быстрые команды для терминальной сессии."""
+        session = self.sessions.get(chat_id)
+        if not session:
+            self.api.send(chat_id, "⚠️ Сначала подключитесь к сессии. /ls")
+            return
+        cmds = self.config["tmux"].get("quick_commands", [])
+        rows, row = [], []
+        for i, c in enumerate(cmds):
+            row.append((c[:24], f"q:{i}"))
+            if len(row) == 2:
+                rows.append(row); row = []
+        if row:
+            rows.append(row)
+        rows.append([("⬅ Назад", "o"), ("🏠 Меню", "menu")])
+        self.api.send(chat_id, f"⚡ Быстрые команды → «{session}»:", keyboard=ikb(rows))
 
     # ── Сессии / стрим ────────────────────────────────────────
 
@@ -457,9 +512,18 @@ class TgTmuxBot:
             [("⬆️", "k:up"), ("⏎", "k:e"), ("⎋ Esc", "k:esc")],
             [("⬅️", "k:left"), ("⬇️", "k:down"), ("➡️", "k:right")],
             [("⇥ Tab", "k:tab"), ("⇧⇥", "k:btab"), ("⛔ Ctrl+C", "k:c")],
-            [("📝 Текст", "input"), ("🔄", "o"), ("🛑 Стоп", "stop")],
-            [("🖥 Сессии", "ls"), ("🏠 Меню", "menu")],
+            [("📝 Текст", "input"), ("⚡ Быстрые", "quick"), ("🔄", "o")],
+            [("🖥 Сессии", "ls"), ("🔌 Откл", "detach"), ("🛑 Стоп", "stop")],
         ])
+
+    def _run_quick(self, chat_id, idx):
+        """Выполнить быструю команду по индексу."""
+        try:
+            cmds = self.config["tmux"].get("quick_commands", [])
+            cmd = cmds[int(idx)]
+        except (ValueError, IndexError):
+            return
+        self._send_to_session(chat_id, cmd)
 
     def _start_stream(self, chat_id, session):
         self._stop_stream(chat_id)
