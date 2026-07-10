@@ -810,6 +810,17 @@ class TestTgBot(unittest.TestCase):
         self.assertEqual(KEY_MAP["btab"], "BTab")
         self.assertEqual(KEY_MAP["esc"], "Escape")
 
+    def test_strip_volatile_ignores_spinner_and_timer(self):
+        """Анимация спиннера и счётчик «esc to interrupt (12s)» не считаются
+        изменением — иначе поток правок затопит Telegram и словит 429/зависание."""
+        from tgbot.bot import _strip_volatile
+        a = "working ⠋ (12s · esc to interrupt)\nreal output"
+        b = "working ⠙ (13s · esc to interrupt)\nreal output"
+        self.assertEqual(_strip_volatile(a), _strip_volatile(b))
+        # реальное изменение текста ловится
+        c = "working\nNEW output"
+        self.assertNotEqual(_strip_volatile(a), _strip_volatile(c))
+
 
 # ── Запуск ────────────────────────────────────────────────────────
 

@@ -38,7 +38,7 @@ class TgBotApi:
                 time.sleep(self.rate_limit_delay - gap)
             self._last = time.time()
 
-    def _call(self, method, params=None, timeout=35):
+    def _call(self, method, params=None, timeout=35, _retry=True):
         self._rate_limit()
         try:
             resp = requests.post(f"{self.base}/{method}", data=params or {}, timeout=timeout)
@@ -48,7 +48,13 @@ class TgBotApi:
         except json.JSONDecodeError:
             raise TgBotError(-1, "Некорректный ответ")
         if not data.get("ok"):
-            raise TgBotError(data.get("error_code", -1), data.get("description", "?"))
+            code = data.get("error_code", -1)
+            # 429 Too Many Requests — честно ждём retry_after и пробуем один раз
+            if code == 429 and _retry:
+                retry = data.get("parameters", {}).get("retry_after", 1)
+                time.sleep(min(retry, 20))
+                return self._call(method, params, timeout, _retry=False)
+            raise TgBotError(code, data.get("description", "?"))
         return data.get("result")
 
     # ── Валидация / информация ─────────────────────────────────

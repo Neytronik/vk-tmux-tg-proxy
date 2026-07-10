@@ -32,6 +32,24 @@ KEY_MAP = {
 }
 
 
+import re as _re
+# Волатильные элементы TUI (спиннер Claude, таймеры) — их изменения игнорируем,
+# чтобы не редактировать сообщение каждую секунду и не ловить 429 от Telegram.
+_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✶✻✽✢·⣾⣽⣻⢿⡿⣟⣯⣷◐◓◑◒"
+_VOLATILE_LINE = _re.compile(r"(esc to interrupt|\(\d+s[^)]*\)|tokens|↑|↓)", _re.I)
+
+
+def _strip_volatile(text):
+    """Убрать спиннер/таймеры для сравнения (анимация ≠ реальное изменение)."""
+    out = []
+    for ln in text.split("\n"):
+        s = "".join(ch for ch in ln if ch not in _SPINNER)
+        if _VOLATILE_LINE.search(s):
+            s = _VOLATILE_LINE.sub("", s)
+        out.append(s.rstrip())
+    return "\n".join(out)
+
+
 def fmt_stream(session_name, raw_output, max_len=3600):
     """Оформить вывод сессии моноширинно (ровный TUI)."""
     output = clean_pane(raw_output)
@@ -730,7 +748,8 @@ class TgTmuxBot:
         # reuse_mid — превращаем сообщение-меню в живой стрим (чат не растёт)
         mid = self._screen(chat_id, text, keyboard=self._pad_kb(), html=True, edit=reuse_mid)
         st = {"session": session, "msg_id": mid, "stop": False,
-              "last": text, "last_change": time.time(), "idle_notified": False}
+              "last": text, "stable": _strip_volatile(text),
+              "last_change": time.time(), "idle_notified": False}
         self.streams[chat_id] = st
         t = threading.Thread(target=self._stream_loop, args=(chat_id,), daemon=True)
         self._stream_threads[chat_id] = t
@@ -755,12 +774,14 @@ class TgTmuxBot:
         my = self.streams.get(chat_id)
         if not my:
             return
-        interval = max(2.0, self._s("watch_interval", 2.0))
+        # Минимум 3с между правками — Telegram лимитирует частое редактирование.
+        interval = max(3.0, self._s("watch_interval", 3.0))
         idle_secs = max(60, self._s("idle_notify_minutes", 10) * 60)
+        fails = 0
         while True:
             if self.streams.get(chat_id) is not my or my.get("stop"):
                 break
-            time.sleep(interval)
+            time.sleep(interval + min(fails * 2, 12))  # backoff при ошибках/429
             if self.streams.get(chat_id) is not my or my.get("stop"):
                 break
             session = my["session"]
@@ -772,11 +793,16 @@ class TgTmuxBot:
             try:
                 raw = get_output(session, self.config["tmux"]["output_lines"])
                 text = fmt_stream(session, raw)
-                if text != my.get("last"):
+                # Сравниваем «стабильную» версию (без спиннера/таймеров Claude),
+                # чтобы анимация не вызывала постоянных правок и 429.
+                stable = _strip_volatile(text)
+                if stable != my.get("stable"):
+                    my["stable"] = stable
                     my["last"] = text
                     my["last_change"] = time.time()
                     my["idle_notified"] = False
-                    self.api.edit(chat_id, my["msg_id"], text, keyboard=self._pad_kb(), html_mode=True)
+                    ok = self.api.edit(chat_id, my["msg_id"], text, keyboard=self._pad_kb(), html_mode=True)
+                    fails = 0 if ok else fails + 1
                 else:
                     # детект простоя
                     if not my["idle_notified"] and (time.time() - my["last_change"]) >= idle_secs:

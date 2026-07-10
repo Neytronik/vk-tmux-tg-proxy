@@ -2113,6 +2113,27 @@ class VkTmuxBot:
                 pass
         threading.Thread(target=_work, daemon=True).start()
 
+    def _tg_load_context_media(self, tg, user_id, peer_id, chat_id, msgs):
+        """При открытии чата — подгрузить реальные медиа из последних сообщений
+        (не только текстовые маркеры), чтобы контекст был полным. В фоне."""
+        # Берём последние сообщения с проксируемым медиа (не больше 6, чтобы не спамить)
+        media_msgs = [m for m in msgs
+                      if m[5] and m[5].get("kind") in ("photo", "voice", "video", "video_note", "file")]
+        media_msgs = media_msgs[-6:]
+        if not media_msgs:
+            return
+
+        def _work():
+            for msg_id, sender, text, date, is_out, media in media_msgs:
+                try:
+                    att = self._tg_proxy_incoming_media(tg, user_id, peer_id, chat_id, msg_id, media)
+                    if att:
+                        bubble = self._tg_format_msg(sender, text, date, is_out, media)
+                        self.vk.send_message(peer_id, bubble, attachment=att)
+                except Exception:
+                    pass
+        threading.Thread(target=_work, daemon=True).start()
+
     def _tg_proxy_incoming_media(self, tg, user_id, peer_id, chat_id, msg_id, media):
         """Скачать медиа из TG и загрузить в VK. Возвращает строку вложения или None."""
         import os
@@ -2286,6 +2307,10 @@ class VkTmuxBot:
             card = self._tg_context_card(display, msgs)
             kb = self._tg_chat_kb(chat_id, user_id, topic_id=topic_id)
             self.vk.send_message(peer_id, card, keyboard=kb)
+
+            # Полный контекст: подгружаем медиа из последних сообщений
+            # (фото/голосовые/файлы) отдельными бабблами — не только маркерами.
+            self._tg_load_context_media(tg, user_id, peer_id, chat_id, msgs)
 
             last_id = max((m[0] for m in msgs), default=0)
             prev = self.tg_state.get(user_id, {})
