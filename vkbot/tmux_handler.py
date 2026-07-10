@@ -100,15 +100,29 @@ def send_control_key(session_name, key):
     return ok
 
 
-def create_session(session_name, work_dir=None):
-    """Создать новую tmux сессию в фоне."""
+def create_session(session_name, work_dir=None, width=None, height=None):
+    """Создать новую tmux сессию в фоне.
+
+    width/height — размер терминала. Узкая ширина (напр. 62) нужна, чтобы
+    TUI Claude Code помещался в чат и не «ехал». Размер фиксируем, чтобы он
+    не менялся под несуществующего клиента.
+    """
     args = ["new-session", "-d", "-s", session_name]
+    if width:
+        args += ["-x", str(width)]
+    if height:
+        args += ["-y", str(height)]
     if work_dir:
-        args.extend(["-c", work_dir])
+        args += ["-c", work_dir]
     ok, _ = _tmux(*args)
-    if ok:
-        return session_exists(session_name)
-    return False
+    if not ok:
+        return False
+    if width or height:
+        # Фиксируем размер окна (иначе tmux ужмёт до 80x24 без клиента)
+        _tmux("set-option", "-t", session_name, "-w", "window-size", "manual")
+        _tmux("resize-window", "-t", session_name,
+              "-x", str(width or 80), "-y", str(height or 40))
+    return session_exists(session_name)
 
 
 def kill_session(session_name):
@@ -180,3 +194,44 @@ def detect_session_state(output):
         return "error"
 
     return "idle"
+
+
+# ── Отрисовка вывода для чата (общая для VK и Telegram ботов) ────
+
+def clean_pane(raw_output):
+    """Убрать хвостовые пробелы (tmux добивает строки до ширины панели — из-за
+    этого текст «едет») и схлопнуть лишние пустые строки."""
+    lines = [ln.rstrip() for ln in raw_output.split("\n")]
+    cleaned = []
+    blank = 0
+    for ln in lines:
+        if ln == "":
+            blank += 1
+            if blank <= 1:
+                cleaned.append(ln)
+        else:
+            blank = 0
+            cleaned.append(ln)
+    return "\n".join(cleaned).strip("\n")
+
+
+_STATE_HINT = {
+    "prompt": " 💬 ждёт ответа",
+    "build": " 🔨 сборка…",
+    "running": " ⚡ выполняется…",
+    "error": " 🚨 ошибка",
+    "idle": "",
+}
+
+
+def format_output(session_name, raw_output, max_len=3500):
+    """Компактно оформить вывод tmux для чата (без «съезда»)."""
+    output = clean_pane(raw_output)
+    if not output.strip():
+        output = "(пусто — напишите текст или нажмите ⏎)"
+    state = detect_session_state(output)
+    hint = _STATE_HINT.get(state, "")
+    if len(output) > max_len:
+        output = f"…(обрезано)\n{output[-max_len:]}"
+    output = highlight_errors(output)
+    return f"📺 {session_name}{hint}\n{'━' * 22}\n{output}"

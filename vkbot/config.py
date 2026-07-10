@@ -31,6 +31,8 @@ DEFAULT_CONFIG = {
         "watch_interval": 2.0,       # интервал автообновления (сек)
         "work_dir": "~",             # рабочая директория для новых сессий
         "idle_notify_minutes": 10,   # тишина N минут → уведомление «сессия остановилась»
+        "term_width": 62,            # ширина терминала — узкая, чтобы TUI Claude
+        "term_height": 40,           # помещался в чат и не «ехал»
     },
     "claude": {
         "command": "claude",         # команда запуска Claude Code
@@ -44,6 +46,13 @@ DEFAULT_CONFIG = {
         "api_id": 0,                 # из https://my.telegram.org
         "api_hash": "",              # из https://my.telegram.org
         "session_file": "~/.vk-tmux-bot/tg_session",  # префикс файлов сессий Telethon
+    },
+    # Telegram-БОТ (управление сервером/Claude из Telegram) — работает независимо от VK.
+    "tgbot": {
+        "enabled": False,            # включить Telegram-бота
+        "bot_token": "",             # токен от @BotFather
+        "admin_ids": [],             # кто управляет сервером (первый — админ)
+        "allowed_user_ids": [],      # кому разрешён бот
     },
 }
 

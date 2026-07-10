@@ -374,7 +374,7 @@ def make_sessions_keyboard(sessions, current=None):
 
 
 def make_kill_keyboard(sessions):
-    """Клавиатура для выбора сессии на удаление."""
+    """Клавиатура для выбора сессии на удаление (с выходом — без тупика)."""
     buttons = []
     row = []
     for s in sessions:
@@ -388,6 +388,11 @@ def make_kill_keyboard(sessions):
             row = []
     if row:
         buttons.append(row)
+    # Всегда есть выход
+    buttons.append([
+        {"label": "🔄 Сессии", "color": SECONDARY, "payload": "/ls"},
+        {"label": "🏠 Меню", "color": PRIMARY, "payload": "/menu"},
+    ])
     return make_keyboard(buttons, one_time=False)
 
 

@@ -58,3 +58,14 @@ claude:
 bot:
   rate_limit_delay: 0.4     # пауза между сообщениями ВК, сек (защита от лимитов)
   long_poll_wait: 25        # таймаут Long Poll, сек
+
+# ── Telegram-БОТ (управление сервером/Claude прямо из Telegram) ──
+# Работает НЕЗАВИСИМО от VK-бота. Нужен токен от @BotFather.
+# Запуск: python3 run_tgbot.py start (или сервис tgbot.service).
+tgbot:
+  enabled: false                # true — включить Telegram-бота
+  bot_token: ""                 # токен от @BotFather
+  admin_ids:
+    - 123456789                 # ← ваш Telegram ID (узнать: @userinfobot)
+  allowed_user_ids:
+    - 123456789

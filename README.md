@@ -1,11 +1,16 @@
-# 🤖 VK ↔ Telegram Proxy Bot
+# 🤖 VK ↔ Telegram · Tmux/Claude Control Suite
 
-Бот для ВКонтакте, который превращает диалог с сообществом в **полноценный
-клиент Telegram** и пульт управления сервером (**tmux + Claude Code**).
+Два бота в одном репозитории с общим ядром:
 
-Пригодится, когда Telegram недоступен напрямую, а ВК работает: заходите в
-сообщество ВК и оттуда читаете/пишете в Telegram, управляете серверными
-сессиями и Claude Code — с телефона, откуда угодно.
+1. **VK-бот** — превращает диалог с сообществом ВК в **полноценный клиент
+   Telegram** (прокси) + пульт управления сервером (**tmux + Claude Code**).
+   Нужен, когда Telegram недоступен напрямую, а ВК работает.
+2. **Telegram-бот** — управление сервером и **Claude Code прямо из Telegram**:
+   сессии, стриминг вывода моноширинно, пульт клавиш, планировщик. Замена
+   Node-решений с расширенным функционалом.
+
+Оба настраиваются и запускаются **независимо** (см. секции `vk` и `tgbot`
+в конфиге). Общее ядро: tmux, планировщик, детект простоя, рендер вывода.
 
 ---
 
@@ -118,14 +123,41 @@ nano ~/.vk-tmux-bot/config.yaml     # заполнить (см. ниже)
 
 ---
 
-## 🛠 Как сервис (автозапуск, переживает перезагрузку)
+## ✈️ Telegram-бот (управление сервером/Claude из Telegram)
+
+Отдельный бот на **Telegram Bot API** — управление tmux и Claude Code без VK.
+
+**Фичи:** список сессий тапом (подключение + стрим), 🤖 Claude / 🧠 DeepClaude,
+**моноширинный стриминг** вывода (TUI Claude ровный — благодаря `<pre>` и узкой
+ширине терминала), 🎮 пульт клавиш (стрелки/Enter/Esc/Tab/Shift+Tab/Ctrl+C),
+планировщик с пайплайнами, детект простоя, `//model` — слэш-команды в Claude,
+персистентность (сессии переживают перезапуск).
+
+**Настройка:** секция `tgbot` в конфиге — `enabled: true`, `bot_token` от
+[@BotFather](https://t.me/botfather), ваш Telegram ID в `admin_ids`
+(узнать: [@userinfobot](https://t.me/userinfobot)).
+
+```bash
+python3 run_tgbot.py start            # запуск
+# как сервис:
+sudo cp tgbot.service /etc/systemd/system/
+sudo systemctl enable --now tgbot
+sudo journalctl -u tgbot -f
+```
+
+**Команды:** `/ls` `/claude` `/dcc` `/new` `/attach` `/kill` `/detach` ·
+`/in 5m sess cmd` `/at 14:30 sess cmd` `/tasks` · пульт кнопками · `//model`.
+
+---
+
+## 🛠 VK-бот как сервис (автозапуск, переживает перезагрузку)
 ```bash
 sudo cp vk-tmux-bot.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now vk-tmux-bot
 sudo journalctl -u vk-tmux-bot -f      # логи
 ```
-> В `vk-tmux-bot.service` поправьте `User=` и пути под себя.
+> В `.service`-файлах поправьте `User=` и пути под себя.
 
 ---
 
@@ -133,16 +165,20 @@ sudo journalctl -u vk-tmux-bot -f      # логи
 
 ```
 vkbot/
-  bot.py            — логика бота (команды, роли, живые ленты)
+  bot.py            — VK-бот (команды, роли, живые ленты, прокси)
   vk_api.py         — VK API + клавиатуры + загрузка медиа
   tg_client.py      — Telethon-обёртка (чаты, папки, топики, медиа)
-  tmux_handler.py   — работа с tmux
-  scheduler.py      — планировщик
+  tmux_handler.py   — tmux + рендер вывода (общее ядро)
+  scheduler.py      — планировщик (общее ядро)
   state_manager.py  — сохранение состояния
   config.py         — конфигурация (YAML)
-run.py              — CLI (init / start / status)
-tests.py            — 58 тестов
-config.example.yaml — пример конфига
+tgbot/
+  api.py            — Telegram Bot API (inline-кнопки, <pre>, стрим)
+  bot.py            — Telegram-бот (переиспользует ядро vkbot)
+run.py              — CLI VK-бота (init / start / status)
+run_tgbot.py        — CLI Telegram-бота (start)
+tests.py            — 59 тестов
+config.example.yaml — пример конфига (секции vk и tgbot)
 ```
 
 Данные (НЕ в репозитории, см. `.gitignore`): `~/.vk-tmux-bot/` —

@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram Tmux/Claude Bot (Python)
+After=network.target
+
+[Service]
+Type=simple
+User=claude
+WorkingDirectory=/home/vkbot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/vkbot/.venv/bin/python3 /home/vkbot/run_tgbot.py start
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

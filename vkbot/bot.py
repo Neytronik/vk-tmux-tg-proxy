@@ -32,6 +32,8 @@ from .tmux_handler import (
     detect_errors,
     highlight_errors,
     detect_session_state,
+    format_output,
+    clean_pane,
 )
 from .state_manager import save_state, load_state
 from .scheduler import (
@@ -57,48 +59,9 @@ def _translit(text):
     return "".join(_TRANSLIT_MAP.get(ch, ch) for ch in text)
 
 
-# Форматирование вывода терминала для VK
-def _clean_pane(raw_output):
-    """Убрать хвостовые пробелы (tmux добивает строки до ширины панели — из-за
-    этого в VK всё «едет») и схлопнуть лишние пустые строки."""
-    lines = [ln.rstrip() for ln in raw_output.split("\n")]
-    # схлопываем 3+ подряд пустых строк в одну
-    cleaned = []
-    blank = 0
-    for ln in lines:
-        if ln == "":
-            blank += 1
-            if blank <= 1:
-                cleaned.append(ln)
-        else:
-            blank = 0
-            cleaned.append(ln)
-    return "\n".join(cleaned).strip("\n")
-
-
-def format_output(session_name, raw_output, max_len=3500):
-    """Оформить вывод tmux для отображения в VK (компактно, без «съезда»)."""
-    output = _clean_pane(raw_output)
-    if not output.strip():
-        output = "(пусто — напишите текст или нажмите ⏎)"
-
-    # Состояние определяем ДО подсветки (иначе ❌-префиксы путают детектор)
-    state = detect_session_state(output)
-    state_hint = {
-        "prompt": " 💬 ждёт ответа",
-        "build": " 🔨 сборка…",
-        "running": " ⚡ выполняется…",
-        "error": " 🚨 ошибка",
-        "idle": "",
-    }.get(state, "")
-
-    # Ограничиваем длину (лимит VK 4096, оставляем запас)
-    if len(output) > max_len:
-        output = f"…(обрезано)\n{output[-max_len:]}"
-
-    output = highlight_errors(output)
-    header = f"📺 {session_name}{state_hint}"
-    return f"{header}\n{'━' * 22}\n{output}"
+# Рендер вывода теперь общий — в tmux_handler (переиспользуется Telegram-ботом).
+# Оставляем алиас _clean_pane для существующих тестов.
+_clean_pane = clean_pane
 
 
 class VkTmuxBot:
@@ -864,6 +827,12 @@ class VkTmuxBot:
 
         self._create_session(peer_id, user_id, name, command)
 
+    def _create_tmux(self, name):
+        """Создать tmux-сессию с настройками из конфига (узкая ширина под TUI)."""
+        t = self.config["tmux"]
+        return create_session(name, work_dir=t.get("work_dir"),
+                              width=t.get("term_width"), height=t.get("term_height"))
+
     def _create_session(self, peer_id, user_id, name, command=None):
         """Создать tmux сессию, подключиться, и опционально выполнить команду."""
         if session_exists(name):
@@ -875,8 +844,7 @@ class VkTmuxBot:
 
         self.vk.send_message(peer_id, f"⏳ Создаю сессию «{name}»...")
 
-        work_dir = self.config["tmux"].get("work_dir", None)
-        if create_session(name, work_dir=work_dir):
+        if self._create_tmux(name):
             self._set_session(user_id, name)
             self._save_state()
             kb = make_main_keyboard(name)
@@ -964,8 +932,17 @@ class VkTmuxBot:
 
             if kill_session(name):
                 self._save_state()
-                self.vk.send_message(peer_id, f"✅ Сессия «{name}» удалена.")
                 print(f"🗑 user={user_id} удалил сессию: {name}")
+                # Показываем ОБНОВЛЁННЫЙ список (не застрявшие кнопки).
+                remaining = list_sessions()
+                if remaining:
+                    self.vk.send_message(
+                        peer_id, f"✅ «{name}» удалена. Ещё удалить?",
+                        keyboard=make_kill_keyboard(remaining))
+                else:
+                    self.vk.send_message(
+                        peer_id, f"✅ «{name}» удалена. Сессий больше нет.",
+                        keyboard=make_main_keyboard(None, is_admin=self._is_admin(user_id)))
             else:
                 self.vk.send_message(peer_id, f"❌ Не удалось удалить сессию «{name}».")
         else:
@@ -1208,7 +1185,7 @@ class VkTmuxBot:
             self._save_state()
         else:
             work_dir = self.config["tmux"].get("work_dir", None)
-            if not create_session(session_name, work_dir=work_dir):
+            if not self._create_tmux(session_name):
                 self.vk.send_message(peer_id, "❌ Не удалось создать сессию.")
                 return
             self._set_session(user_id, session_name)
@@ -2910,7 +2887,7 @@ class VkTmuxBot:
         # Создаём сессию (если существует — используем существующую)
         if not session_exists(task.session_name):
             work_dir = self.config["tmux"].get("work_dir", None)
-            if not create_session(task.session_name, work_dir=work_dir):
+            if not self._create_tmux(task.session_name):
                 self.vk.send_message(
                     task.peer_id,
                     f"⏰❌ Не удалось создать сессию {task.session_name} для задачи {task.id}"
