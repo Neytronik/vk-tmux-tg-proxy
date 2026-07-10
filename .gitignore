@@ -1,0 +1,30 @@
+# Виртуальное окружение
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Боевой конфиг и данные (НИКОГДА не коммитить — там токены и сессии!)
+config.yaml
+config.json
+*.session
+*.session-journal
+tg_favorites.json
+tg_accounts.json
+tg_open_chats.json
+users.json
+state.json
+scheduled.json
+
+# Локальная директория данных, если вдруг окажется в проекте
+.vk-tmux-bot/
+
+# Прочее
+.DS_Store
+*.log
+*.swp
