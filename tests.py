@@ -517,6 +517,11 @@ class TestVkKeyboards(unittest.TestCase):
         self.assertEqual(B._feed_delta(["A", "B", "C"], ["B", "C", "D"]), ["D"])
         self.assertEqual(B._feed_delta(["A", "B"], ["A", "B"]), [])
         self.assertEqual(B._feed_delta(["A"], ["X", "Y"]), ["X", "Y"])
+        # РЕГРЕССИЯ: строка-приглашение «$» превращается в «$ cmd» — дельта
+        # должна быть только новым (команда+вывод+приглашение), а не всё заново
+        self.assertEqual(
+            B._feed_delta(["motd", "$"], ["motd", "$ pwd", "/home", "$"]),
+            ["$ pwd", "/home", "$"])
 
     def test_feed_chunk(self):
         """Резка длинного вывода на куски под лимит сообщения."""
