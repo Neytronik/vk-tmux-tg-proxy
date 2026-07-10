@@ -2537,37 +2537,17 @@ class VkTmuxBot:
                 favs = self.tg_favorites.get(user_id, set())
                 fav_last = my_w.setdefault("fav_last", {})
 
-                # Находим чаты где непрочитанных стало больше.
-                # Избранные — пушим реальные сообщения; остальные — компактно.
-                notifications = []
+                # Уведомления ТОЛЬКО по избранным чатам — остальные не трогаем.
                 for name, chat_id, unread, preview, kind in dialogs:
-                    if chat_id in muted or chat_id == open_chat:
+                    if chat_id not in favs or chat_id in muted or chat_id == open_chat:
                         continue
                     old = seen.get(chat_id, 0)
                     if unread > old and unread > 0:
                         icon = self._TG_KIND_ICON.get(kind, "💬")
-                        if chat_id in favs:
-                            self._tg_push_favorite(user_id, peer_id, chat_id, name,
-                                                   icon, unread, fav_last)
-                        else:
-                            notifications.append((name, chat_id, unread, preview, icon))
+                        self._tg_push_favorite(user_id, peer_id, chat_id, name,
+                                               icon, unread, fav_last)
 
                 my_w["seen"] = snapshot
-
-                # Обычные (не избранные) — компактно, не более 5 за раз
-                for name, chat_id, unread, preview, icon in notifications[:5]:
-                    kb = make_keyboard([[
-                        {"label": f"💬 Открыть {name}"[:40], "color": "primary",
-                         "payload": f"/tg open {chat_id}"},
-                    ]], one_time=False)
-                    self.vk.send_message(
-                        peer_id,
-                        f"🔔 {icon} {name} +{unread}\n{preview}",
-                        keyboard=kb,
-                    )
-                if len(notifications) > 5:
-                    self.vk.send_message(
-                        peer_id, f"…и ещё {len(notifications) - 5} чатов с новыми сообщениями. /tg unread")
             except Exception:
                 pass
 
@@ -2590,20 +2570,23 @@ class VkTmuxBot:
             fav_last[chat_id] = max((m[0] for m in msgs), default=since)
             if not fresh:
                 return
-            jump_kb = make_keyboard([[
-                {"label": f"➡️ Перейти в диалог", "color": "primary",
-                 "payload": f"/tg open {chat_id}"},
-            ]], one_time=False)
             # Шапка избранного, затем сами сообщения бабблами
             self.vk.send_message(peer_id, f"⭐ {icon} {name}")
-            for i, (msg_id, sender, text, date, is_out, media) in enumerate(fresh[-5:]):
+            for msg_id, sender, text, date, is_out, media in fresh[-5:]:
                 bubble = self._tg_format_msg(sender, text, date, is_out, media)
-                last = (i == len(fresh[-5:]) - 1)
-                kb = jump_kb if last else None
                 if media and media.get("kind") in ("photo", "file", "voice", "video", "video_note"):
-                    self._tg_proxy_incoming_async(user_id, peer_id, chat_id, msg_id, media, bubble, kb)
+                    self._tg_proxy_incoming_async(user_id, peer_id, chat_id, msg_id, media, bubble, None)
                 else:
-                    self.vk.send_message(peer_id, bubble, keyboard=kb)
+                    self.vk.send_message(peer_id, bubble)
+            # Навигационный футер (гарантированно последним, с полными кнопками)
+            nav = make_keyboard([
+                [{"label": "➡️ Перейти в диалог", "color": "primary",
+                  "payload": f"/tg open {chat_id}"}],
+                [{"label": "📋 К чатам", "color": "secondary", "payload": "/tg back"},
+                 {"label": "🔕 Не уведомлять", "color": "secondary",
+                  "payload": f"/tg unfav {chat_id}"}],
+            ], one_time=False)
+            self.vk.send_message(peer_id, "───", keyboard=nav)
         except Exception:
             pass
 

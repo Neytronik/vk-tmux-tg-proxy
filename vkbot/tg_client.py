@@ -130,10 +130,15 @@ class TgClient:
             return None, "Не подключен к Telegram"
 
         async def _get():
+            me = await self.client.get_me()
+            my_id = me.id if me else None
             dialogs = await self.client.get_dialogs(limit=limit)
             result = []
             for d in dialogs:
                 name = d.name or "Без имени"
+                # «Избранное» — чат с самим собой (заметки)
+                if my_id is not None and d.id == my_id:
+                    name = "⭐ Избранное (заметки)"
                 if len(name) > 30:
                     name = name[:28] + "…"
                 preview = ""
@@ -353,6 +358,9 @@ class TgClient:
             return str(chat_id)
 
         async def _get():
+            me = await self.client.get_me()
+            if me and int(chat_id) == me.id:
+                return "⭐ Избранное (заметки)"
             entity = await self.client.get_entity(chat_id)
             return getattr(entity, 'first_name', None) or entity.title or str(chat_id)
 
