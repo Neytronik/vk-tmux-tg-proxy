@@ -58,7 +58,41 @@ class TgTmuxBot:
         self.streams = {}           # chat_id -> {session, msg_id, stop, ...}
         self._stream_threads = {}
         self.pending = {}           # chat_id -> режим ввода
+        self.settings = {}          # рантайм-настройки (override конфига)
         self._lock = threading.Lock()
+
+    # ── Настройки (рантайм, поверх конфига) ───────────────────
+
+    def _settings_file(self):
+        from vkbot.config import CONFIG_DIR
+        return os.path.join(CONFIG_DIR, "tgbot_settings.json")
+
+    def _load_settings(self):
+        import json
+        p = self._settings_file()
+        if os.path.exists(p):
+            try:
+                self.settings = json.load(open(p))
+            except Exception:
+                self.settings = {}
+
+    def _save_settings(self):
+        import json, tempfile
+        from vkbot.config import CONFIG_DIR
+        try:
+            os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=CONFIG_DIR, suffix=".tmp")
+            with os.fdopen(fd, "w") as f:
+                json.dump(self.settings, f)
+            os.replace(tmp, self._settings_file())
+        except Exception:
+            pass
+
+    def _s(self, key, default):
+        """Значение настройки (рантайм override → конфиг → дефолт)."""
+        if key in self.settings:
+            return self.settings[key]
+        return self.config["tmux"].get(key, default)
 
     # ── Персистентность (активные сессии переживают ребут) ────
 
@@ -108,7 +142,11 @@ class TgTmuxBot:
     def _allowed(self, uid):
         cfg = self.config["tgbot"]
         ids = set(cfg.get("allowed_user_ids", [])) | set(cfg.get("admin_ids", []))
+        ids |= set(self.settings.get("extra_allowed", []))
         return uid in ids
+
+    def _is_admin(self, uid):
+        return uid in set(self.config["tgbot"].get("admin_ids", []))
 
     # ── Запуск ────────────────────────────────────────────────
 
@@ -146,6 +184,7 @@ class TgTmuxBot:
 
         allowed = set(tg.get("allowed_user_ids", [])) | set(tg.get("admin_ids", []))
         print(f"✅ Разрешённые: {sorted(allowed)}")
+        self._load_settings()
         self._load_sessions()
         self.scheduler.start()
         self._resume_streams()
@@ -172,13 +211,21 @@ class TgTmuxBot:
                 updates = self.api.get_updates(offset=offset, timeout=25)
                 for upd in updates:
                     offset = upd["update_id"] + 1
-                    try:
-                        self._handle_update(upd)
-                    except Exception as e:
-                        print(f"⚠️ Ошибка обработки: {e}")
+                    # Обработка в отдельном потоке — поллинг НЕ блокируется
+                    # (иначе долгие операции подвешивают отклик на кнопки).
+                    threading.Thread(
+                        target=self._safe_handle, args=(upd,), daemon=True).start()
             except Exception as e:
                 print(f"❌ Poll: {e}")
                 time.sleep(3)
+
+    def _safe_handle(self, upd):
+        try:
+            self._handle_update(upd)
+        except Exception as e:
+            print(f"⚠️ Ошибка обработки: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _handle_update(self, upd):
         if "message" in upd:
@@ -205,11 +252,14 @@ class TgTmuxBot:
             self.api.delete(chat_id, msg["message_id"])
             return
 
-        # Режим ожидания ввода (имя сессии и т.п.)
+        # Режим ожидания ввода (имя сессии, текст, ID юзера) — слэш прерывает
         if chat_id in self.pending and not text.startswith("/"):
             mode = self.pending.pop(chat_id)
-            self._handle_pending(chat_id, mode, text)
+            # своё сообщение удаляем — чат не растёт
+            self.api.delete(chat_id, msg["message_id"])
+            self._handle_pending(chat_id, uid, mode, text)
             return
+        self.pending.pop(chat_id, None)  # слэш-команда отменяет ожидание
 
         if text.startswith("/"):
             parts = text.split(maxsplit=1)
@@ -221,63 +271,91 @@ class TgTmuxBot:
             self._send_to_session(chat_id, text)
             self.api.delete(chat_id, msg["message_id"])
         else:
-            self._cmd_menu(chat_id)
+            self._cmd_menu(chat_id, uid=uid)
 
-    def _handle_pending(self, chat_id, mode, text):
+    def _handle_pending(self, chat_id, uid, mode, text):
         if mode == "new":
-            name = text.strip().split()[0]
+            name = text.strip().split()[0] if text.strip() else ""
             self._create_and_open(chat_id, name)
         elif mode == "send":
             self._send_to_session(chat_id, text)
-        elif mode.startswith("sched:"):
-            when = mode.split(":", 1)[1]
-            self._schedule_from_text(chat_id, when, text)
+        elif mode == "adduser":
+            self._admin_adduser(chat_id, uid, text)
 
     # ── Callback (inline-кнопки) ──────────────────────────────
 
+    def _screen(self, chat_id, text, keyboard=None, html=False, edit=None):
+        """Показать экран: РЕДАКТИРОВАТЬ сообщение (edit=mid) или отправить новое.
+        Навигация правит одно сообщение — чат не растёт, ощущается нативно."""
+        if edit:
+            if self.api.edit(chat_id, edit, text, keyboard=keyboard, html_mode=html):
+                return edit
+        return self.api.send(chat_id, text, keyboard=keyboard, html_mode=html)
+
     def _handle_callback(self, cb):
         chat_id = cb["message"]["chat"]["id"]
+        mid = cb["message"]["message_id"]
         uid = cb.get("from", {}).get("id", 0)
         data = cb.get("data", "")
         self.api.answer_callback(cb["id"])
         if not self._allowed(uid):
             return
 
+        # Навигационные экраны — редактируем текущее сообщение (edit=mid)
         if data == "menu":
-            self._cmd_menu(chat_id)
+            self._cmd_menu(chat_id, edit=mid)
         elif data == "ls":
-            self._cmd_ls(chat_id)
-        elif data == "claude":
-            self._launch_ai(chat_id, "claude")
-        elif data == "dcc":
-            self._launch_ai(chat_id, "dcc")
-        elif data == "new":
-            self.pending[chat_id] = "new"
-            self.api.send(chat_id, "➕ Имя новой сессии:")
+            self._cmd_ls(chat_id, edit=mid)
         elif data == "tasks":
-            self._cmd_tasks(chat_id)
-        elif data == "stop":
-            self._stop_stream(chat_id)
-            self.api.send(chat_id, "🛑 Стрим остановлен.", keyboard=self._menu_kb())
+            self._cmd_tasks(chat_id, edit=mid)
+        elif data == "manage":
+            self._cmd_manage(chat_id, edit=mid)
+        elif data == "quick":
+            self._cmd_quick(chat_id, edit=mid)
+        elif data == "settings":
+            self._cmd_settings(chat_id, edit=mid)
+        elif data == "admin":
+            self._cmd_admin(chat_id, uid, edit=mid)
+        # Открытие сессии/Claude — превращаем это же сообщение в живой стрим
+        elif data == "claude":
+            self._launch_ai(chat_id, "claude", reuse_mid=mid)
+        elif data == "dcc":
+            self._launch_ai(chat_id, "dcc", reuse_mid=mid)
+        elif data.startswith("open:"):
+            self._attach_and_stream(chat_id, data[5:], reuse_mid=mid)
         elif data == "o":
             self._refresh_stream(chat_id)
-        elif data == "manage":
-            self._cmd_manage(chat_id)
-        elif data == "quick":
-            self._cmd_quick(chat_id)
+        elif data == "new":
+            self.pending[chat_id] = "new"
+            self._screen(chat_id, "➕ Имя новой сессии:", keyboard=self._cancel_kb(chat_id), edit=mid)
+        elif data == "stop":
+            self._stop_stream(chat_id)
+            self._screen(chat_id, "🛑 Стрим остановлен.", keyboard=self._menu_kb(), edit=mid)
         elif data == "detach":
-            self._detach(chat_id)
-        elif data.startswith("open:"):
-            self._attach_and_stream(chat_id, data[5:])
+            self._detach(chat_id, edit=mid)
         elif data.startswith("kill:"):
-            self._kill(chat_id, data[5:])
+            self._kill(chat_id, data[5:], edit=mid)
         elif data.startswith("k:"):
             self._send_key(chat_id, data[2:])
         elif data.startswith("q:"):
             self._run_quick(chat_id, data[2:])
+        elif data.startswith("cancel:"):
+            self._cmd_cancel(chat_id, data[7:])
+        elif data.startswith("deluser:"):
+            self._admin_deluser(chat_id, uid, data[8:], edit=mid)
+        elif data == "adduser":
+            if self._is_admin(uid):
+                self.pending[chat_id] = "adduser"
+                self._screen(chat_id, "➕ Telegram ID нового пользователя:",
+                             keyboard=ikb([[("⬅ Отмена", "admin")]]), edit=mid)
+        elif data == "help":
+            self._cmd_help(chat_id, edit=mid)
+        elif data.startswith("set:"):
+            self._apply_setting(chat_id, data[4:], edit=mid)
         elif data == "input":
             self.pending[chat_id] = "send"
-            self.api.send(chat_id, "📝 Текст для отправки в сессию:")
+            self._screen(chat_id, "📝 Текст для отправки в сессию:",
+                         keyboard=self._cancel_kb(chat_id), edit=mid)
 
     # ── Команды ───────────────────────────────────────────────
 
@@ -285,7 +363,11 @@ class TgTmuxBot:
         if cmd in ("start", "help", "помощь"):
             self._cmd_help(chat_id)
         elif cmd in ("menu", "меню"):
-            self._cmd_menu(chat_id)
+            self._cmd_menu(chat_id, uid=uid)
+        elif cmd in ("settings", "настройки"):
+            self._cmd_settings(chat_id)
+        elif cmd in ("admin", "админ", "админка"):
+            self._cmd_admin(chat_id, uid)
         elif cmd in ("ls", "sessions", "сессии"):
             self._cmd_ls(chat_id)
         elif cmd in ("manage", "управление"):
@@ -297,7 +379,7 @@ class TgTmuxBot:
                 self._create_and_open(chat_id, args.strip().split()[0], args)
             else:
                 self.pending[chat_id] = "new"
-                self.api.send(chat_id, "➕ Имя новой сессии (можно: имя команда):")
+                self.api.send(chat_id, "➕ Имя новой сессии (можно: имя команда):", keyboard=self._cancel_kb(chat_id))
         elif cmd in ("claude", "клод"):
             self._launch_ai(chat_id, "claude")
         elif cmd in ("dcc", "дкк"):
@@ -332,7 +414,7 @@ class TgTmuxBot:
                 self._send_to_session(chat_id, args)
             else:
                 self.pending[chat_id] = "send"
-                self.api.send(chat_id, "📝 Текст:")
+                self.api.send(chat_id, "📝 Текст:", keyboard=self._cancel_kb(chat_id))
         elif cmd in ("in", "через"):
             self._cmd_schedule(chat_id, args, is_at=False)
         elif cmd in ("at", "в"):
@@ -344,7 +426,7 @@ class TgTmuxBot:
         else:
             self.api.send(chat_id, f"❓ Неизвестная команда: /{cmd}\n/help — список")
 
-    def _cmd_help(self, chat_id):
+    def _cmd_help(self, chat_id, edit=None):
         msg = (
             "🤖 <b>Tmux / Claude Code — из Telegram</b>\n\n"
             "🖥 <b>Сессии</b>\n"
@@ -365,63 +447,181 @@ class TgTmuxBot:
             "/tasks · /cancel id\n\n"
             "💤 Тишина сессии N мин → уведомление «готово»"
         )
-        self.api.send(chat_id, msg, keyboard=self._menu_kb(), html_mode=True)
+        self._screen(chat_id, msg, keyboard=ikb([[("🏠 Меню", "menu"), ("🖥 Сессии", "ls")]]),
+                     html=True, edit=edit)
 
     def _menu_kb(self):
         return ikb([
             [("🖥 Сессии", "ls"), ("➕ Новая", "new")],
             [("🤖 Claude", "claude"), ("🧠 DeepClaude", "dcc")],
-            [("⏰ Задачи", "tasks"), ("ℹ️ Помощь", "menu")],
+            [("⏰ Задачи", "tasks"), ("⚙️ Настройки", "settings")],
+            [("🏠 Меню", "menu")],
         ])
 
-    def _cmd_menu(self, chat_id):
-        self.api.send(chat_id, "⚡ Главное меню — выберите действие:", keyboard=self._menu_kb())
+    def _nav_kb(self, chat_id):
+        """Навигация для любого экрана: назад в сессию (если есть) + меню."""
+        rows = []
+        if self.sessions.get(chat_id):
+            rows.append([("🔄 К сессии", "o"), ("🖥 Сессии", "ls")])
+        else:
+            rows.append([("🖥 Сессии", "ls")])
+        rows.append([("🏠 Меню", "menu")])
+        return ikb(rows)
+
+    def _cancel_kb(self, chat_id):
+        """Приглашение ввода — с кнопкой отмены (назад в сессию/меню)."""
+        target = "o" if self.sessions.get(chat_id) else "menu"
+        return ikb([[("⬅ Отмена", target)]])
+
+    # ── Настройки ─────────────────────────────────────────────
+
+    def _cmd_settings(self, chat_id, edit=None):
+        idle = self._s("idle_notify_minutes", 10)
+        iv = self._s("watch_interval", 2.0)
+        w = self._s("term_width", 62)
+
+        def m(cur, key, val, lbl):
+            active = (float(cur) == float(val))
+            return (("✅ " if active else "") + lbl, f"set:{key}:{val}")
+
+        rows = [
+            [("💤 Простой → уведомление:", "settings")],
+            [m(idle, "idle", 5, "5м"), m(idle, "idle", 10, "10м"),
+             m(idle, "idle", 15, "15м"), m(idle, "idle", 30, "30м")],
+            [("🔄 Частота обновления:", "settings")],
+            [m(iv, "iv", 2, "2с"), m(iv, "iv", 3, "3с"), m(iv, "iv", 5, "5с")],
+            [("📏 Ширина терминала:", "settings")],
+            [m(w, "w", 50, "50"), m(w, "w", 62, "62"), m(w, "w", 80, "80")],
+            [("🖥 Сессии", "ls"), ("🏠 Меню", "menu")],
+        ]
+        self._screen(chat_id,
+                     "⚙️ <b>Настройки</b>\n"
+                     "Меняются на лету и сохраняются. Ширина — для новых сессий.",
+                     keyboard=ikb(rows), html=True, edit=edit)
+
+    def _apply_setting(self, chat_id, spec, edit=None):
+        try:
+            key, val = spec.split(":")
+        except ValueError:
+            return
+        if key == "idle":
+            self.settings["idle_notify_minutes"] = int(val)
+        elif key == "iv":
+            self.settings["watch_interval"] = float(val)
+        elif key == "w":
+            self.settings["term_width"] = int(val)
+        self._save_settings()
+        self._cmd_settings(chat_id, edit=edit)
+
+    # ── Админка ───────────────────────────────────────────────
+
+    def _cmd_admin(self, chat_id, uid, edit=None):
+        if not self._is_admin(uid):
+            self._screen(chat_id, "🔒 Только для администратора.", keyboard=self._menu_kb(), edit=edit)
+            return
+        cfg = self.config["tgbot"]
+        admins = cfg.get("admin_ids", [])
+        allowed = set(cfg.get("allowed_user_ids", [])) | set(self.settings.get("extra_allowed", []))
+        lines = ["👑 <b>Админка</b> — доступ к боту", "", "Администраторы:"]
+        lines += [f"  • <code>{a}</code>" for a in admins]
+        others = [u for u in allowed if u not in admins]
+        lines += ["", "Пользователи:"] + ([f"  • <code>{u}</code>" for u in others] or ["  (нет)"])
+        rows = [[("➕ Добавить юзера", "adduser")]]
+        for u in others:
+            rows.append([(f"🗑 Убрать {u}", f"deluser:{u}")])
+        rows.append([("🏠 Меню", "menu")])
+        self._screen(chat_id, "\n".join(lines), keyboard=ikb(rows), html=True, edit=edit)
+
+    def _admin_deluser(self, chat_id, uid, target, edit=None):
+        if not self._is_admin(uid):
+            return
+        try:
+            tid = int(target)
+        except ValueError:
+            return
+        extra = set(self.settings.get("extra_allowed", []))
+        extra.discard(tid)
+        self.settings["extra_allowed"] = list(extra)
+        # если был в конфиге — тоже убираем на лету (в рантайме)
+        cfg = self.config["tgbot"]
+        if tid in cfg.get("allowed_user_ids", []):
+            cfg["allowed_user_ids"] = [x for x in cfg["allowed_user_ids"] if x != tid]
+        self._save_settings()
+        self._cmd_admin(chat_id, uid, edit=edit)
+
+    def _admin_adduser(self, chat_id, uid, text):
+        if not self._is_admin(uid):
+            return
+        try:
+            tid = int(text.strip().split()[0])
+        except (ValueError, IndexError):
+            self.api.send(chat_id, "❌ Нужен числовой Telegram ID.",
+                          keyboard=ikb([[("⬅ Назад", "admin")]]))
+            return
+        extra = set(self.settings.get("extra_allowed", []))
+        extra.add(tid)
+        self.settings["extra_allowed"] = list(extra)
+        self._save_settings()
+        self.api.send(chat_id, f"✅ Пользователь {tid} добавлен.")
+        self._cmd_admin(chat_id, uid)
+
+    def _cmd_menu(self, chat_id, uid=None, edit=None):
+        is_adm = self._is_admin(uid) if uid else False
+        rows = [
+            [("🖥 Сессии", "ls"), ("➕ Новая", "new")],
+            [("🤖 Claude", "claude"), ("🧠 DeepClaude", "dcc")],
+            [("⏰ Задачи", "tasks"), ("⚙️ Настройки", "settings")],
+        ]
+        if is_adm:
+            rows.append([("👑 Админка", "admin"), ("ℹ️ Помощь", "help")])
+        else:
+            rows.append([("ℹ️ Помощь", "help")])
+        cur = self.sessions.get(chat_id)
+        title = f"⚡ <b>Главное меню</b>" + (f"\nАктивная сессия: <b>{cur}</b>" if cur else "")
+        self._screen(chat_id, title, keyboard=ikb(rows), html=True, edit=edit)
 
     _STATUS_ICON = {"prompt": "💬", "build": "🔨", "running": "⚡", "error": "🚨", "idle": "🟢"}
 
     def _session_status(self, name):
-        """Иконка состояния сессии (быстрый взгляд на список)."""
         try:
             out = get_output(name, 25)
             return self._STATUS_ICON.get(detect_session_state(out), "🟢")
         except Exception:
             return "•"
 
-    def _cmd_ls(self, chat_id):
+    def _cmd_ls(self, chat_id, edit=None):
         sessions = list_sessions()
         cur = self.sessions.get(chat_id)
         if not sessions:
-            self.api.send(chat_id, "📭 Активных сессий нет.\nСоздайте новую или запустите Claude:",
-                          keyboard=ikb([[("➕ Новая", "new"), ("🤖 Claude", "claude")],
-                                        [("🏠 Меню", "menu")]]))
+            self._screen(chat_id, "📭 Активных сессий нет.\nСоздайте новую или запустите Claude:",
+                         keyboard=ikb([[("➕ Новая", "new"), ("🤖 Claude", "claude")],
+                                       [("🏠 Меню", "menu")]]), edit=edit)
             return
         rows = []
         for s in sessions:
             mark = "▶ " if s == cur else ""
-            st = self._session_status(s)
-            rows.append([(f"{mark}{st} {s}", f"open:{s}")])
+            rows.append([(f"{mark}{self._session_status(s)} {s}", f"open:{s}")])
         rows.append([("➕ Новая", "new"), ("🗑 Управление", "manage")])
         rows.append([("🏠 Меню", "menu")])
-        self.api.send(chat_id,
-                      f"🖥 <b>Сессии</b> ({len(sessions)}) — тап, чтобы подключиться:\n"
-                      f"🟢 готова · ⚡ работает · 💬 ждёт · 🚨 ошибка",
-                      keyboard=ikb(rows), html_mode=True)
+        self._screen(chat_id,
+                     f"🖥 <b>Сессии</b> ({len(sessions)}) — тап, чтобы подключиться:\n"
+                     f"🟢 готова · ⚡ работает · 💬 ждёт · 🚨 ошибка",
+                     keyboard=ikb(rows), html=True, edit=edit)
 
-    def _cmd_manage(self, chat_id):
-        """Экран управления: удаление сессий (с выходом — без тупика)."""
+    def _cmd_manage(self, chat_id, edit=None):
         sessions = list_sessions()
         if not sessions:
-            self._cmd_ls(chat_id)
+            self._cmd_ls(chat_id, edit=edit)
             return
         rows = [[(f"🗑 {s}", f"kill:{s}")] for s in sessions]
         rows.append([("⬅ К сессиям", "ls"), ("🏠 Меню", "menu")])
-        self.api.send(chat_id, "🗑 Тап — удалить сессию:", keyboard=ikb(rows))
+        self._screen(chat_id, "🗑 Тап — удалить сессию:", keyboard=ikb(rows), edit=edit)
 
-    def _cmd_quick(self, chat_id):
-        """Быстрые команды для терминальной сессии."""
+    def _cmd_quick(self, chat_id, edit=None):
         session = self.sessions.get(chat_id)
         if not session:
-            self.api.send(chat_id, "⚠️ Сначала подключитесь к сессии. /ls")
+            self._screen(chat_id, "⚠️ Сначала подключитесь к сессии.",
+                         keyboard=self._nav_kb(chat_id), edit=edit)
             return
         cmds = self.config["tmux"].get("quick_commands", [])
         rows, row = [], []
@@ -432,14 +632,15 @@ class TgTmuxBot:
         if row:
             rows.append(row)
         rows.append([("⬅ Назад", "o"), ("🏠 Меню", "menu")])
-        self.api.send(chat_id, f"⚡ Быстрые команды → «{session}»:", keyboard=ikb(rows))
+        self._screen(chat_id, f"⚡ Быстрые команды → «{session}»:", keyboard=ikb(rows), edit=edit)
 
     # ── Сессии / стрим ────────────────────────────────────────
 
     def _create_tmux(self, name):
         t = self.config["tmux"]
         return create_session(name, work_dir=t.get("work_dir"),
-                              width=t.get("term_width"), height=t.get("term_height"))
+                              width=self._s("term_width", 62),
+                              height=self._s("term_height", 40))
 
     def _create_and_open(self, chat_id, name, full_args=None):
         import re
@@ -463,7 +664,7 @@ class TgTmuxBot:
     def _create_and_open_named(self, chat_id, name):
         self._create_and_open(chat_id, name)
 
-    def _launch_ai(self, chat_id, kind):
+    def _launch_ai(self, chat_id, kind, reuse_mid=None):
         session = kind  # 'claude' или 'dcc'
         cfg = self.config.get("claude", {})
         command = cfg.get("command", "claude") if kind == "claude" else cfg.get("deepclaude_command", "dcc")
@@ -471,41 +672,39 @@ class TgTmuxBot:
         self.api.typing(chat_id)
         if not session_exists(session):
             if not self._create_tmux(session):
-                self.api.send(chat_id, "❌ Не удалось создать сессию.")
+                self._screen(chat_id, "❌ Не удалось создать сессию.",
+                             keyboard=self._menu_kb(), edit=reuse_mid)
                 return
             time.sleep(0.4)
             send_keys(session, command, press_enter=True)
             time.sleep(1.2)
             print(f"{label}: запущен")
-        self._attach_and_stream(chat_id, session)
+        self._attach_and_stream(chat_id, session, reuse_mid=reuse_mid)
 
-    def _attach_and_stream(self, chat_id, name):
+    def _attach_and_stream(self, chat_id, name, reuse_mid=None):
         if not session_exists(name):
-            self.api.send(chat_id, f"❌ Сессии «{name}» нет.")
+            self._screen(chat_id, f"❌ Сессии «{name}» нет.", keyboard=self._menu_kb(), edit=reuse_mid)
             return
         self.sessions[chat_id] = name
         self._save_sessions()
-        self._start_stream(chat_id, name)
+        self._start_stream(chat_id, name, reuse_mid=reuse_mid)
 
-    def _detach(self, chat_id):
+    def _detach(self, chat_id, edit=None):
         self._stop_stream(chat_id)
         self.sessions.pop(chat_id, None)
         self._save_sessions()
-        self.api.send(chat_id, "🔌 Отключено. Сессия продолжает работать.",
-                      keyboard=self._menu_kb())
+        self._cmd_menu(chat_id, edit=edit)
 
-    def _kill(self, chat_id, name):
+    def _kill(self, chat_id, name, edit=None):
         if not name:
             return
         if self.sessions.get(chat_id) == name:
             self._stop_stream(chat_id)
             self.sessions.pop(chat_id, None)
             self._save_sessions()
-        if kill_session(name):
-            # После удаления показываем ОБНОВЛЁННЫЙ список (не застрявшие кнопки)
-            self._cmd_ls(chat_id)
-        else:
-            self.api.send(chat_id, f"❌ Не удалось удалить «{name}».")
+        kill_session(name)
+        # Всегда показываем ОБНОВЛЁННЫЙ экран управления (не застрявшие кнопки)
+        self._cmd_manage(chat_id, edit=edit)
 
     def _pad_kb(self):
         return ikb([
@@ -525,10 +724,11 @@ class TgTmuxBot:
             return
         self._send_to_session(chat_id, cmd)
 
-    def _start_stream(self, chat_id, session):
+    def _start_stream(self, chat_id, session, reuse_mid=None):
         self._stop_stream(chat_id)
         text = fmt_stream(session, get_output(session, self.config["tmux"]["output_lines"]))
-        mid = self.api.send(chat_id, text, keyboard=self._pad_kb(), html_mode=True)
+        # reuse_mid — превращаем сообщение-меню в живой стрим (чат не растёт)
+        mid = self._screen(chat_id, text, keyboard=self._pad_kb(), html=True, edit=reuse_mid)
         st = {"session": session, "msg_id": mid, "stop": False,
               "last": text, "last_change": time.time(), "idle_notified": False}
         self.streams[chat_id] = st
@@ -546,7 +746,7 @@ class TgTmuxBot:
     def _refresh_stream(self, chat_id):
         s = self.sessions.get(chat_id)
         if not s:
-            self.api.send(chat_id, "⚠️ Нет активной сессии. /ls")
+            self.api.send(chat_id, "⚠️ Нет активной сессии.", keyboard=self._nav_kb(chat_id))
             return
         if chat_id not in self.streams:
             self._start_stream(chat_id, s)
@@ -555,8 +755,8 @@ class TgTmuxBot:
         my = self.streams.get(chat_id)
         if not my:
             return
-        interval = max(2.0, self.config["tmux"].get("watch_interval", 2.0))
-        idle_secs = max(60, self.config["tmux"].get("idle_notify_minutes", 10) * 60)
+        interval = max(2.0, self._s("watch_interval", 2.0))
+        idle_secs = max(60, self._s("idle_notify_minutes", 10) * 60)
         while True:
             if self.streams.get(chat_id) is not my or my.get("stop"):
                 break
@@ -598,7 +798,7 @@ class TgTmuxBot:
     def _send_to_session(self, chat_id, text):
         session = self.sessions.get(chat_id)
         if not session:
-            self.api.send(chat_id, "⚠️ Нет активной сессии. /ls")
+            self.api.send(chat_id, "⚠️ Нет активной сессии.", keyboard=self._nav_kb(chat_id))
             return
         if not session_exists(session):
             self.api.send(chat_id, f"❌ Сессия «{session}» не существует.")
@@ -669,22 +869,26 @@ class TgTmuxBot:
         if task.is_pipeline:
             body = "\n".join(f"  {i+1}. {c[:60]}" for i, c in enumerate(commands))
             self.api.send(chat_id, f"⏰ Пайплайн запланирован (id {tid})\n"
-                                   f"Сессия: {session}\n{body}\nЗадержка: {delay}с\nСтарт: {when}")
+                                   f"Сессия: {session}\n{body}\nЗадержка: {delay}с\nСтарт: {when}",
+                          keyboard=ikb([[("⏰ Задачи", "tasks"), ("🏠 Меню", "menu")]]))
         else:
-            self.api.send(chat_id, f"⏰ Задача {tid}: «{commands[0][:60]}» в сессии {session} — {when}\n"
-                                   f"Отмена: /cancel {tid}")
+            self.api.send(chat_id, f"⏰ Задача {tid}: «{commands[0][:60]}» в сессии {session} — {when}",
+                          keyboard=ikb([[("⏰ Задачи", "tasks"), ("🏠 Меню", "menu")]]))
 
     def _cmd_tasks(self, chat_id):
         tasks = self.scheduler.list_tasks(chat_id)
         if not tasks:
-            self.api.send(chat_id, "📭 Нет задач.\n/in 5m сессия команда — создать",
+            self.api.send(chat_id, "📭 Нет запланированных задач.\n"
+                                   "Создать: /in 5m сессия команда",
                           keyboard=self._menu_kb())
             return
-        lines = [f"📋 Задачи ({len(tasks)}):"]
+        lines = [f"📋 <b>Задачи</b> ({len(tasks)}):"]
+        rows = []
         for t in tasks:
-            lines.append(f"• {t.id}: {t.summary()}")
-            lines.append(f"   отмена: /cancel {t.id}")
-        self.api.send(chat_id, "\n".join(lines))
+            lines.append(f"• <code>{t.id}</code> {t.summary()}")
+            rows.append([(f"🗑 Отменить {t.id}", f"cancel:{t.id}")])
+        rows.append([("🖥 Сессии", "ls"), ("🏠 Меню", "menu")])
+        self.api.send(chat_id, "\n".join(lines), keyboard=ikb(rows), html_mode=True)
 
     def _cmd_cancel(self, chat_id, tid):
         if not tid:
@@ -692,10 +896,11 @@ class TgTmuxBot:
             return
         task = self.scheduler.get_task(tid)
         if not task or task.user_id != chat_id:
-            self.api.send(chat_id, f"❌ Задача {tid} не найдена.")
+            self.api.send(chat_id, f"❌ Задача {tid} не найдена.", keyboard=self._menu_kb())
             return
         self.scheduler.remove_task(tid)
         self.api.send(chat_id, f"✅ Задача {tid} отменена.")
+        self._cmd_tasks(chat_id)
 
     def _execute_task(self, task):
         chat_id = task.peer_id

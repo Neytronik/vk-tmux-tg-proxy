@@ -361,15 +361,21 @@ def make_sessions_keyboard(sessions, current=None):
     if row:
         buttons.append(row)
 
-    # Кнопки действий
-    action_row = [
-        {"label": "➕ Новая сессия", "color": POSITIVE, "payload": "/new"},
-    ]
-    buttons.append(action_row)
+    # Кнопки действий + навигация (всегда есть выход)
     if sessions:
         buttons.append([
-            {"label": "🗑 Удалить...", "color": NEGATIVE, "payload": "/kill"},
+            {"label": "➕ Новая", "color": POSITIVE, "payload": "/new"},
+            {"label": "🗑 Удалить", "color": NEGATIVE, "payload": "/kill"},
         ])
+    else:
+        buttons.append([
+            {"label": "➕ Новая", "color": POSITIVE, "payload": "/new"},
+            {"label": "🤖 Claude", "color": POSITIVE, "payload": "/claude"},
+        ])
+    buttons.append([
+        {"label": "✈️ Telegram", "color": PRIMARY, "payload": "/tg"},
+        {"label": "🏠 Меню", "color": PRIMARY, "payload": "/menu"},
+    ])
     return make_keyboard(buttons, one_time=False)
 
 
@@ -430,7 +436,10 @@ def make_notify_keyboard(current_state):
     on_label = "🔔 ВКЛ" if current_state else "🔔 Вкл"
     off_label = "🔕 ВЫКЛ" if not current_state else "🔕 Выкл"
 
-    return make_keyboard([[
-        {"label": on_label, "color": on_color, "payload": "/notify on"},
-        {"label": off_label, "color": off_color, "payload": "/notify off"},
-    ]], one_time=False)
+    return make_keyboard([
+        [
+            {"label": on_label, "color": on_color, "payload": "/notify on"},
+            {"label": off_label, "color": off_color, "payload": "/notify off"},
+        ],
+        [{"label": "🏠 Меню", "color": PRIMARY, "payload": "/menu"}],
+    ], one_time=False)

@@ -18,6 +18,7 @@ tg_favorites.json
 tg_accounts.json
 tg_open_chats.json
 tgbot_state.json
+tgbot_settings.json
 users.json
 state.json
 scheduled.json

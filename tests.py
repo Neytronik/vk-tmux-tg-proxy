@@ -480,19 +480,20 @@ class TestVkKeyboards(unittest.TestCase):
         self.assertIn("▶ sess2", labels)
         self.assertIn("sess1", labels)
         self.assertIn("sess3", labels)
-        self.assertIn("➕ Новая сессия", labels)
-        self.assertIn("🗑 Удалить...", labels)
+        self.assertIn("➕ Новая", labels)
+        self.assertIn("🗑 Удалить", labels)
+        # Навигация всегда есть — без тупика
+        self.assertIn("🏠 Меню", labels)
 
     def test_sessions_keyboard_empty(self):
-        """Клавиатура без сессий."""
+        """Клавиатура без сессий — тоже с навигацией."""
         kb = make_sessions_keyboard([], None)
         labels = []
         for row in kb["buttons"]:
             for btn in row:
                 labels.append(btn["action"]["label"])
-        self.assertIn("➕ Новая сессия", labels)
-        # Для пустого списка не должно быть кнопки удаления
-        self.assertNotIn("🗑 Удалить...", labels)
+        self.assertIn("➕ Новая", labels)
+        self.assertIn("🏠 Меню", labels)
 
     def test_kill_keyboard(self):
         """Клавиатура удаления."""
