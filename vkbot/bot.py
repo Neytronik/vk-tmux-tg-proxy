@@ -91,6 +91,10 @@ class VkTmuxBot:
         self.tg_watch_cfg = {}        # {user_id: interval_sec} — сохранённые настройки
         self.tg_open_chat = {}        # {user_id: {chat_id, topic_id}} — открытый чат (персист)
         self._tg_vk_sent = {}         # {user_id: deque(msg_id)} — что отправлено ИЗ VK (чтобы не дублировать)
+        self._tg_fav_last = {}        # {user_id: {chat_id: last_pushed_id}} — дедуп пуша избранного
+        self._tg_catchup_ts = {}      # {user_id: ts} — троттлинг догоняющего опроса
+        self._tg_fav_lock = threading.Lock()  # атомарный claim диапазона пуша избранного
+        self._transcribe_sem = threading.Semaphore(3)  # не более 3 опросов расшифровки разом
         self._tg_lock = threading.Lock()  # защита избранного/мутов/настроек
         self._clients_lock = threading.Lock()  # защита создания TG-клиентов
         self._persist_lock = threading.Lock()  # защита записи JSON-файлов
@@ -1780,6 +1784,10 @@ class VkTmuxBot:
             self.vk.send_message(peer_id, "❌ Telegram не настроен.")
             return
 
+        # Вход в Telegram-раздел — сразу досылаем накопившееся из избранного
+        if page == 0:
+            self._tg_catchup_favorites(user_id, peer_id)
+
         def _load():
             try:
                 if not self._tg_ensure_connected(tg, peer_id):
@@ -2109,13 +2117,20 @@ class VkTmuxBot:
         if not mid or not media or media.get("kind") != "voice":
             return
         def _poll():
-            for _ in range(12):          # до ~36с ожидания
-                time.sleep(3.0)
-                state, text = self.vk.get_audio_transcript(mid)
-                if state == "done":
-                    if text and text.strip():
-                        self.vk.send_message(peer_id, f"📝 {text.strip()}")
-                    return
+            # Семафор ограничивает число одновременных опросов (пачка голосовых
+            # не разведёт десятки потоков по rate-limited VK API).
+            if not self._transcribe_sem.acquire(timeout=30):
+                return
+            try:
+                for _ in range(12):          # до ~36с ожидания
+                    time.sleep(3.0)
+                    state, text = self.vk.get_audio_transcript(mid)
+                    if state == "done":
+                        if text and text.strip():
+                            self.vk.send_message(peer_id, f"📝 {text.strip()}")
+                        return
+            finally:
+                self._transcribe_sem.release()
         threading.Thread(target=_poll, daemon=True).start()
 
     def _send_media_bubble(self, user_id, peer_id, chat_id, msg_id, media, bubble, kb=None):
@@ -2142,15 +2157,17 @@ class VkTmuxBot:
         не показала его повторно (исходящие с телефона она покажет, эти — нет)."""
         if not msg_id:
             return
-        dq = self._tg_vk_sent.get(user_id)
-        if dq is None:
-            dq = deque(maxlen=400)
-            self._tg_vk_sent[user_id] = dq
-        dq.append(msg_id)
+        with self._tg_fav_lock:
+            dq = self._tg_vk_sent.get(user_id)
+            if dq is None:
+                dq = deque(maxlen=2000)
+                self._tg_vk_sent[user_id] = dq
+            dq.append(msg_id)
 
     def _is_vk_sent(self, user_id, msg_id):
-        dq = self._tg_vk_sent.get(user_id)
-        return bool(dq) and msg_id in dq
+        with self._tg_fav_lock:
+            dq = self._tg_vk_sent.get(user_id)
+            return bool(dq) and msg_id in dq
 
     def _select_context_media(self, msgs):
         """Какие сообщения из истории подгрузить реальными медиа при открытии чата.
@@ -2525,17 +2542,16 @@ class VkTmuxBot:
                     # Первый проход — базовая линия, без уведомлений.
                     # Для избранных запоминаем last_id, чтобы потом не вывалить историю.
                     my_w["seen"] = snapshot
-                    fl = my_w.setdefault("fav_last", {})
+                    fl = self._tg_fav_last.setdefault(user_id, {})
                     favs0 = self.tg_favorites.get(user_id, set())
                     for _n, cid, unread0, _p, _k in dialogs:
-                        if cid in favs0 and unread0 > 0:
+                        if cid in favs0 and unread0 > 0 and cid not in fl:
                             m0, e0 = tg.get_messages(cid, limit=1)
                             if not e0 and m0:
                                 fl[cid] = m0[-1][0]
                     continue
 
                 favs = self.tg_favorites.get(user_id, set())
-                fav_last = my_w.setdefault("fav_last", {})
 
                 # Уведомления ТОЛЬКО по избранным чатам — остальные не трогаем.
                 for name, chat_id, unread, preview, kind in dialogs:
@@ -2545,7 +2561,7 @@ class VkTmuxBot:
                     if unread > old and unread > 0:
                         icon = self._TG_KIND_ICON.get(kind, "💬")
                         self._tg_push_favorite(user_id, peer_id, chat_id, name,
-                                               icon, unread, fav_last)
+                                               icon, unread)
 
                 my_w["seen"] = snapshot
             except Exception:
@@ -2554,20 +2570,25 @@ class VkTmuxBot:
         if self.tg_watch.get(user_id) is my_w:
             self._tg_watch_threads.pop(user_id, None)
 
-    def _tg_push_favorite(self, user_id, peer_id, chat_id, name, icon, unread, fav_last):
+    def _tg_push_favorite(self, user_id, peer_id, chat_id, name, icon, unread):
         """Пуш реальных новых сообщений из ИЗБРАННОГО чата бабблами (текст+медиа)
-        с кнопкой перехода в диалог. Дедуп по последнему показанному id."""
+        с кнопкой перехода в диалог. Дедуп по последнему показанному id
+        (общее хранилище self._tg_fav_last — не дублирует watch и догоняющий опрос)."""
         tg = self._get_tg(user_id)
         if not tg or not tg.is_ready:
             return
         try:
-            since = fav_last.get(chat_id, 0)
-            msgs, err = tg.get_messages(chat_id, limit=min(max(unread, 1), 8))
+            msgs, err = tg.get_messages(chat_id, limit=min(max(unread, 1), 20))
             if err or not msgs:
                 return
-            # Только новые входящие (свои — не пушим, они и так синхронятся при открытии)
-            fresh = [m for m in msgs if m[0] > since and not m[4]]
-            fav_last[chat_id] = max((m[0] for m in msgs), default=since)
+            newmax = max((m[0] for m in msgs), default=0)
+            # Атомарный claim: под локом читаем since и сразу двигаем указатель,
+            # чтобы watch и догоняющий опрос не запушили одно и то же.
+            with self._tg_fav_lock:
+                fav_last = self._tg_fav_last.setdefault(user_id, {})
+                since = fav_last.get(chat_id, 0)
+                fresh = [m for m in msgs if m[0] > since and not m[4]]
+                fav_last[chat_id] = max(newmax, since)
             if not fresh:
                 return
             # Шапка избранного, затем сами сообщения бабблами
@@ -2589,6 +2610,40 @@ class VkTmuxBot:
             self.vk.send_message(peer_id, "───", keyboard=nav)
         except Exception:
             pass
+
+    def _tg_catchup_favorites(self, user_id, peer_id):
+        """Догоняющий опрос: при входе в Telegram-меню сразу досылаем новые
+        сообщения из избранных чатов (то, что накопилось, пока вы не смотрели).
+        Троттлится, дедуп общий с watch — повторов не будет."""
+        favs = self.tg_favorites.get(user_id, set())
+        if not favs:
+            return
+        now = time.time()
+        if now - self._tg_catchup_ts.get(user_id, 0) < 8:
+            return  # не гоняем на каждый чих навигации
+        self._tg_catchup_ts[user_id] = now
+
+        def _work():
+            tg = self._get_tg(user_id)
+            if not tg or not tg.is_ready:
+                return
+            try:
+                dialogs, err = tg.get_dialogs(limit=100)
+                if err or not dialogs:
+                    return
+                muted = self.tg_muted.get(user_id, set())
+                open_chat = (self.tg_live.get(user_id) or {}).get("chat_id")
+                for name, chat_id, unread, preview, kind in dialogs:
+                    if chat_id not in favs or chat_id in muted or chat_id == open_chat:
+                        continue
+                    if unread <= 0:
+                        continue  # непрочитанных нет — догонять нечего
+                    # Доставляем накопившиеся непрочитанные (дедуп по self._tg_fav_last)
+                    icon = self._TG_KIND_ICON.get(kind, "💬")
+                    self._tg_push_favorite(user_id, peer_id, chat_id, name, icon, unread)
+            except Exception:
+                pass
+        threading.Thread(target=_work, daemon=True).start()
 
     def _resume_watches(self):
         """Восстановить сохранённые уведомления после перезапуска бота."""
@@ -2678,7 +2733,9 @@ class VkTmuxBot:
             try:
                 if not tg or not tg.is_ready:
                     break
-                msgs, err = tg.get_messages(chat_id, limit=15, topic_id=topic_id)
+                # Окно с запасом: если между поллами прилетело много сообщений,
+                # берём больше, чтобы не потерять старые из пачки.
+                msgs, err = tg.get_messages(chat_id, limit=40, topic_id=topic_id)
                 if err:
                     errors += 1
                     if errors >= 10:
@@ -2687,7 +2744,7 @@ class VkTmuxBot:
                     continue
                 errors = 0
 
-                new_msgs = [m for m in msgs if m[0] > last_id]
+                new_msgs = sorted((m for m in msgs if m[0] > last_id), key=lambda m: m[0])
                 if not new_msgs:
                     continue
 
@@ -2717,11 +2774,10 @@ class VkTmuxBot:
                     break
                 time.sleep(min(errors * 2, 20))
 
-        # Снимаем регистрацию только если это всё ещё мой поток
+        # Снимаем регистрацию ТОЛЬКО если это всё ещё мой поток —
+        # иначе снесём регистрацию свежезапущенной ленты (identity-guard).
         if self.tg_live.get(user_id) is my_live:
             self._tg_live_threads.pop(user_id, None)
-
-        self._tg_live_threads.pop(user_id, None)
 
     def _tg_send_media(self, peer_id, user_id, attachments, caption):
         """Скачать вложения из VK и отправить в активный чат Telegram (в фоне)."""

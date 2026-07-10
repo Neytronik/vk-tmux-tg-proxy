@@ -269,15 +269,23 @@ class VkApi:
         import os
         title = title or os.path.basename(file_path)
         try:
+            self._guard_file(file_path)
             # 1. Адрес для загрузки (group-токен: видео уходит в сообщество)
             save = self._call("video.save", {"name": title[:128], "is_private": 1,
                                              "wallpost": 0})
             upload_url = save["upload_url"]
             owner_id = save.get("owner_id")
             vid = save.get("video_id")
-            # 2. Заливаем файл
+            if not upload_url or owner_id is None or vid is None:
+                return None
+            # 2. Заливаем файл (проверяем, что сервер принял)
             with open(file_path, "rb") as f:
-                requests.post(upload_url, files={"video_file": (title, f)}, timeout=300)
+                r = requests.post(upload_url, files={"video_file": (title, f)}, timeout=300)
+            try:
+                if r.json().get("size") == 0:
+                    return None
+            except Exception:
+                pass  # некоторые ответы video без JSON — не критично
             return f"video{owner_id}_{vid}"
         except Exception:
             return None
