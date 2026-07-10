@@ -35,6 +35,14 @@ DEFAULT_CONFIG = {
         "term_height": 40,           # помещался в чат и не «ехал»
         # Быстрые команды — кнопки для частых действий в терминальной сессии
         "quick_commands": ["ls -la", "git status", "clear", "htop", "pwd", "df -h"],
+        # Мои проекты — секция быстрого старта сессий в нужной папке.
+        # Каждый проект: name (подпись), path (рабочая папка).
+        # Необязательно: session (имя tmux-сессии, по умолчанию = name).
+        # Тап по проекту в боте → сессия стартует прямо в его папке + кнопки Claude/DCC.
+        "projects": [
+            # {"name": "mockarty", "path": "/home/mockarty"},
+            # {"name": "robolance", "path": "/home/robolance"},
+        ],
     },
     "claude": {
         "command": "claude",         # команда запуска Claude Code

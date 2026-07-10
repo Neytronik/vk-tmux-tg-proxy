@@ -369,10 +369,10 @@ def make_tg_menu_keyboard():
     ], one_time=False)
 
 
-def make_main_keyboard(session_name=None, is_admin=False):
+def make_main_keyboard(session_name=None, is_admin=False, has_projects=False):
     """Главная клавиатура — зависит от того, есть ли активная сессия."""
     if session_name:
-        return make_keyboard([
+        rows = [
             [
                 {"label": "📺 Вывод", "color": PRIMARY, "payload": "/o"},
                 {"label": "👁 Следить", "color": PRIMARY, "payload": "/watch"},
@@ -389,6 +389,10 @@ def make_main_keyboard(session_name=None, is_admin=False):
                 {"label": "🤖 Claude", "color": POSITIVE, "payload": "/claude"},
                 {"label": "🧠 DeepClaude", "color": POSITIVE, "payload": "/dcc"},
             ],
+        ]
+        if has_projects:
+            rows.append([{"label": "📂 Мои проекты", "color": PRIMARY, "payload": "/projects"}])
+        rows += [
             [
                 {"label": "✈️ Telegram", "color": PRIMARY, "payload": "/tg"},
                 {"label": "🔄 Сессии", "color": SECONDARY, "payload": "/ls"},
@@ -397,7 +401,8 @@ def make_main_keyboard(session_name=None, is_admin=False):
                 {"label": "🔌 Откл.", "color": SECONDARY, "payload": "/detach"},
                 {"label": "🗑 Удалить", "color": NEGATIVE, "payload": "/kill"},
             ],
-        ], one_time=False)
+        ]
+        return make_keyboard(rows, one_time=False)
     else:
         rows = [
             [
@@ -408,11 +413,13 @@ def make_main_keyboard(session_name=None, is_admin=False):
                 {"label": "📋 Сессии", "color": SECONDARY, "payload": "/ls"},
                 {"label": "➕ Новая", "color": POSITIVE, "payload": "/new"},
             ],
-            [
-                {"label": "⏰ Отложить", "color": SECONDARY, "payload": "/in"},
-                {"label": "ℹ️ Помощь", "color": SECONDARY, "payload": "/help"},
-            ],
         ]
+        if has_projects:
+            rows.append([{"label": "📂 Мои проекты", "color": PRIMARY, "payload": "/projects"}])
+        rows.append([
+            {"label": "⏰ Отложить", "color": SECONDARY, "payload": "/in"},
+            {"label": "ℹ️ Помощь", "color": SECONDARY, "payload": "/help"},
+        ])
         if is_admin:
             rows.append([{"label": "👑 Админка", "color": SECONDARY, "payload": "/admin"}])
         return make_keyboard(rows, one_time=False)

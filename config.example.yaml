@@ -50,6 +50,14 @@ tmux:
   work_dir: "~"             # рабочая директория новых сессий
   idle_notify_minutes: 10   # тишина N минут → уведомление «сессия остановилась»
                             # (удобно для Claude: закончил задачу/петлю)
+  # Мои проекты — быстрый старт сессий сразу в нужной папке.
+  # Тап по проекту в боте → сессия стартует в его папке + кнопки Claude/DCC/Терминал.
+  # name — подпись, path — рабочая папка, session (необяз.) — имя tmux-сессии.
+  # projects:
+  #   - name: mockarty
+  #     path: /home/mockarty
+  #   - name: robolance
+  #     path: /home/robolance
 
 claude:
   command: "claude"             # команда запуска Claude Code (кнопка «🤖 Claude»)

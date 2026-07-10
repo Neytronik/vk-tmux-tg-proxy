@@ -337,12 +337,24 @@ class TgTmuxBot:
             self._cmd_tasks(chat_id, edit=mid)
         elif data == "manage":
             self._cmd_manage(chat_id, edit=mid)
-        elif data == "quick":
-            self._cmd_quick(chat_id, edit=mid)
         elif data == "settings":
             self._cmd_settings(chat_id, edit=mid)
         elif data == "admin":
             self._cmd_admin(chat_id, uid, edit=mid)
+        elif data == "projects":
+            self._cmd_projects(chat_id, edit=mid)
+        elif data.startswith("proj:"):
+            try:
+                self._cmd_project(chat_id, int(data[5:]), edit=mid)
+            except ValueError:
+                self._cmd_projects(chat_id, edit=mid)
+        elif data.startswith("pj:"):
+            # pj:<idx>:<kind>
+            try:
+                _, sidx, kind = data.split(":", 2)
+                self._launch_project(chat_id, int(sidx), kind, reuse_mid=mid)
+            except ValueError:
+                self._cmd_projects(chat_id, edit=mid)
         # Открытие сессии/Claude — превращаем это же сообщение в живой стрим
         elif data == "claude":
             self._launch_ai(chat_id, "claude", reuse_mid=mid)
@@ -364,6 +376,17 @@ class TgTmuxBot:
             self._kill(chat_id, data[5:], edit=mid)
         elif data.startswith("k:"):
             self._send_key(chat_id, data[2:])
+        elif data == "quick":
+            # Во время стрима — просто меняем набор кнопок на том же сообщении
+            if chat_id in self.streams:
+                self.streams[chat_id]["kb_mode"] = "quick"
+                self._rerender_stream(chat_id)
+            else:
+                self._cmd_quick(chat_id, edit=mid)
+        elif data == "padmode":
+            if chat_id in self.streams:
+                self.streams[chat_id]["kb_mode"] = "pad"
+                self._rerender_stream(chat_id)
         elif data.startswith("q:"):
             self._run_quick(chat_id, data[2:])
         elif data.startswith("cancel:"):
@@ -381,7 +404,10 @@ class TgTmuxBot:
             self._apply_setting(chat_id, data[4:], edit=mid)
         elif data == "input":
             self.pending[chat_id] = "send"
-            self._screen(chat_id, "📝 Текст для отправки в сессию:",
+            # Пауза стрима, чтобы приглашение ввода не затёрлось перерисовкой
+            if chat_id in self.streams:
+                self.streams[chat_id]["paused"] = True
+            self._screen(chat_id, "📝 Напишите текст — уйдёт в сессию:",
                          keyboard=self._cancel_kb(chat_id), edit=mid)
 
     # ── Команды ───────────────────────────────────────────────
@@ -597,8 +623,10 @@ class TgTmuxBot:
         rows = [
             [("🖥 Сессии", "ls"), ("➕ Новая", "new")],
             [("🤖 Claude", "claude"), ("🧠 DeepClaude", "dcc")],
-            [("⏰ Задачи", "tasks"), ("⚙️ Настройки", "settings")],
         ]
+        if self._projects():
+            rows.append([("📂 Мои проекты", "projects")])
+        rows.append([("⏰ Задачи", "tasks"), ("⚙️ Настройки", "settings")])
         if is_adm:
             rows.append([("👑 Админка", "admin"), ("ℹ️ Помощь", "help")])
         else:
@@ -663,11 +691,83 @@ class TgTmuxBot:
 
     # ── Сессии / стрим ────────────────────────────────────────
 
-    def _create_tmux(self, name):
+    def _create_tmux(self, name, work_dir=None):
         t = self.config["tmux"]
-        return create_session(name, work_dir=t.get("work_dir"),
+        return create_session(name, work_dir=work_dir or t.get("work_dir"),
                               width=self._s("term_width", 62),
                               height=self._s("term_height", 40))
+
+    # ── Мои проекты (конфиг-driven) ───────────────────────────
+    def _projects(self):
+        """Список проектов из конфига: [{name, path, session}, ...] (валидные)."""
+        out = []
+        for p in (self.config.get("tmux", {}).get("projects") or []):
+            if not isinstance(p, dict):
+                continue
+            name = str(p.get("name") or "").strip()
+            path = str(p.get("path") or "").strip()
+            if not name or not path:
+                continue
+            sess = str(p.get("session") or name).strip()
+            # имя сессии tmux — только безопасные символы
+            sess = _re.sub(r"[^a-zA-Z0-9_-]", "-", sess)
+            out.append({"name": name, "path": path, "session": sess})
+        return out
+
+    def _cmd_projects(self, chat_id, edit=None):
+        projs = self._projects()
+        if not projs:
+            self._screen(chat_id,
+                         "📂 <b>Мои проекты</b>\n\nНе настроены. Добавьте в конфиг "
+                         "секцию <code>tmux.projects</code> (name + path).",
+                         keyboard=self._nav_kb(chat_id), html=True, edit=edit)
+            return
+        rows, row = [], []
+        for i, p in enumerate(projs):
+            row.append((f"📁 {p['name']}", f"proj:{i}"))
+            if len(row) == 2:
+                rows.append(row); row = []
+        if row:
+            rows.append(row)
+        rows.append([("🏠 Меню", "menu")])
+        self._screen(chat_id, "📂 <b>Мои проекты</b>\nВыберите проект:",
+                     keyboard=ikb(rows), html=True, edit=edit)
+
+    def _cmd_project(self, chat_id, idx, edit=None):
+        projs = self._projects()
+        if idx < 0 or idx >= len(projs):
+            self._cmd_projects(chat_id, edit=edit)
+            return
+        p = projs[idx]
+        running = " · ▶ запущена" if session_exists(p["session"]) else ""
+        rows = [
+            [(f"🤖 Claude", f"pj:{idx}:claude"), (f"🧠 DeepClaude", f"pj:{idx}:dcc")],
+            [("🖥 Терминал", f"pj:{idx}:sh")],
+            [("⬅ Проекты", "projects"), ("🏠 Меню", "menu")],
+        ]
+        self._screen(chat_id,
+                     f"📁 <b>{p['name']}</b>{running}\n"
+                     f"<code>{p['path']}</code>\n\nЧто запустить в этой папке?",
+                     keyboard=ikb(rows), html=True, edit=edit)
+
+    def _launch_project(self, chat_id, idx, kind, reuse_mid=None):
+        projs = self._projects()
+        if idx < 0 or idx >= len(projs):
+            self._cmd_projects(chat_id, edit=reuse_mid)
+            return
+        p = projs[idx]
+        if kind == "sh":
+            # просто терминал в папке проекта
+            if session_exists(p["session"]):
+                self._attach_and_stream(chat_id, p["session"], reuse_mid=reuse_mid)
+            elif self._create_tmux(p["session"], work_dir=p["path"]):
+                self._attach_and_stream(chat_id, p["session"], reuse_mid=reuse_mid)
+            else:
+                self._screen(chat_id, "❌ Не удалось создать сессию.",
+                             keyboard=self._menu_kb(), edit=reuse_mid)
+            return
+        self._launch_ai(chat_id, kind, reuse_mid=reuse_mid,
+                        work_dir=p["path"], session_name=p["session"])
 
     def _create_and_open(self, chat_id, name, full_args=None):
         import re
@@ -691,21 +791,21 @@ class TgTmuxBot:
     def _create_and_open_named(self, chat_id, name):
         self._create_and_open(chat_id, name)
 
-    def _launch_ai(self, chat_id, kind, reuse_mid=None):
-        session = kind  # 'claude' или 'dcc'
+    def _launch_ai(self, chat_id, kind, reuse_mid=None, work_dir=None, session_name=None):
+        session = session_name or kind  # 'claude'/'dcc' или имя проекта
         cfg = self.config.get("claude", {})
         command = cfg.get("command", "claude") if kind == "claude" else cfg.get("deepclaude_command", "dcc")
         label = "🤖 Claude Code" if kind == "claude" else "🧠 DeepClaude"
         self.api.typing(chat_id)
         if not session_exists(session):
-            if not self._create_tmux(session):
+            if not self._create_tmux(session, work_dir=work_dir):
                 self._screen(chat_id, "❌ Не удалось создать сессию.",
                              keyboard=self._menu_kb(), edit=reuse_mid)
                 return
             time.sleep(0.4)
             send_keys(session, command, press_enter=True)
             time.sleep(1.2)
-            print(f"{label}: запущен")
+            print(f"{label}: запущен ({session})")
         self._attach_and_stream(chat_id, session, reuse_mid=reuse_mid)
 
     def _attach_and_stream(self, chat_id, name, reuse_mid=None):
@@ -742,14 +842,61 @@ class TgTmuxBot:
             [("🖥 Сессии", "ls"), ("🔌 Откл", "detach"), ("🛑 Стоп", "stop")],
         ])
 
+    def _quick_inline_kb(self):
+        """Клавиатура быстрых команд ВНУТРИ стрима (текст терминала не меняем —
+        меняется только набор кнопок на том же сообщении)."""
+        cmds = self.config["tmux"].get("quick_commands", [])
+        rows, row = [], []
+        for i, c in enumerate(cmds):
+            row.append((c[:22], f"q:{i}"))
+            if len(row) == 2:
+                rows.append(row); row = []
+        if row:
+            rows.append(row)
+        rows.append([("⬅ Клавиши", "padmode")])
+        return ikb(rows)
+
+    def _stream_kb(self, chat_id):
+        """Клавиатура для сообщения-стрима по текущему режиму (пульт/быстрые)."""
+        st = self.streams.get(chat_id)
+        if st and st.get("kb_mode") == "quick":
+            return self._quick_inline_kb()
+        return self._pad_kb()
+
+    def _rerender_stream(self, chat_id):
+        """Немедленно перерисовать сообщение-стрим (текущий вывод + клавиатура
+        по режиму) — чтобы смена набора кнопок была мгновенной, без нового окна."""
+        st = self.streams.get(chat_id)
+        if not st:
+            return
+        session = st["session"]
+        try:
+            text = fmt_stream(session, get_output(session, self.config["tmux"]["output_lines"]))
+            st["stable"] = _strip_volatile(text)
+            self.api.edit(chat_id, st["msg_id"], text,
+                          keyboard=self._stream_kb(chat_id), html_mode=True)
+        except Exception:
+            pass
+
     def _run_quick(self, chat_id, idx):
-        """Выполнить быструю команду по индексу."""
+        """Выполнить быструю команду по индексу и вернуть пульт (без новых окон)."""
         try:
             cmds = self.config["tmux"].get("quick_commands", [])
             cmd = cmds[int(idx)]
         except (ValueError, IndexError):
             return
-        self._send_to_session(chat_id, cmd)
+        st = self.streams.get(chat_id)
+        if st:
+            st["kb_mode"] = "pad"   # возвращаем пульт
+        session = self.sessions.get(chat_id)
+        if session and session_exists(session):
+            send_keys(session, cmd, press_enter=True)
+            if chat_id not in self.streams:
+                self._start_stream(chat_id, session)
+            else:
+                self._rerender_stream(chat_id)
+        else:
+            self._send_to_session(chat_id, cmd)
 
     def _start_stream(self, chat_id, session, reuse_mid=None):
         self._stop_stream(chat_id)
@@ -758,7 +905,8 @@ class TgTmuxBot:
         mid = self._screen(chat_id, text, keyboard=self._pad_kb(), html=True, edit=reuse_mid)
         st = {"session": session, "msg_id": mid, "stop": False,
               "last": text, "stable": _strip_volatile(text),
-              "last_change": time.time(), "idle_notified": False}
+              "last_change": time.time(), "idle_notified": False,
+              "kb_mode": "pad", "paused": False}
         self.streams[chat_id] = st
         t = threading.Thread(target=self._stream_loop, args=(chat_id,), daemon=True)
         self._stream_threads[chat_id] = t
@@ -776,7 +924,14 @@ class TgTmuxBot:
         if not s:
             self.api.send(chat_id, "⚠️ Нет активной сессии.", keyboard=self._nav_kb(chat_id))
             return
-        if chat_id not in self.streams:
+        st = self.streams.get(chat_id)
+        if st:
+            # снимаем паузу/подменю — возвращаемся к живому терминалу
+            st["paused"] = False
+            st["kb_mode"] = "pad"
+            self.pending.pop(chat_id, None)
+            self._rerender_stream(chat_id)
+        else:
             self._start_stream(chat_id, s)
 
     def _stream_loop(self, chat_id):
@@ -793,6 +948,8 @@ class TgTmuxBot:
             time.sleep(interval + min(fails * 2, 12))  # backoff при ошибках/429
             if self.streams.get(chat_id) is not my or my.get("stop"):
                 break
+            if my.get("paused"):
+                continue  # открыт модальный ввод — терминал не перерисовываем
             session = my["session"]
             if not session_exists(session):
                 self.api.send(chat_id, f"❌ Сессия «{session}» завершилась.", keyboard=self._menu_kb())
@@ -810,7 +967,8 @@ class TgTmuxBot:
                     my["last"] = text
                     my["last_change"] = time.time()
                     my["idle_notified"] = False
-                    ok = self.api.edit(chat_id, my["msg_id"], text, keyboard=self._pad_kb(), html_mode=True)
+                    ok = self.api.edit(chat_id, my["msg_id"], text,
+                                       keyboard=self._stream_kb(chat_id), html_mode=True)
                     fails = 0 if ok else fails + 1
                 else:
                     # детект простоя
@@ -841,7 +999,12 @@ class TgTmuxBot:
             return
         self.api.typing(chat_id)
         send_keys(session, text, press_enter=True)
-        if chat_id not in self.streams:
+        st = self.streams.get(chat_id)
+        if st:
+            st["paused"] = False       # ввод завершён — терминал снова живой
+            st["kb_mode"] = "pad"
+            self._rerender_stream(chat_id)
+        else:
             self._start_stream(chat_id, session)
 
     def _send_key(self, chat_id, cmd):

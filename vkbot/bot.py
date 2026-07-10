@@ -438,6 +438,7 @@ class VkTmuxBot:
         "unwatch", "стоп", "s", "send", "отправить", "e", "enter", "c", "d",
         "session", "сессия", "detach", "откл", "claude", "клод", "dcc", "дкк",
         "in", "через", "at", "в", "tasks", "задачи", "cancel", "отмена",
+        "projects", "проекты", "proj", "pj",
         # клавиши пульта
         "up", "down", "left", "right", "esc", "escape", "tab", "btab",
         "space", "bspace", "pgup", "pgdn", "home", "end",
@@ -511,6 +512,10 @@ class VkTmuxBot:
             "клод": self._cmd_claude,
             "dcc": self._cmd_dcc,
             "дкк": self._cmd_dcc,
+            "projects": self._cmd_projects,
+            "проекты": self._cmd_projects,
+            "proj": self._cmd_proj,
+            "pj": self._cmd_pj,
             # Вывод
             "o": self._cmd_output,
             "output": self._cmd_output,
@@ -748,7 +753,8 @@ class VkTmuxBot:
   /tasks · /cancel <id>"""
         if self._is_admin(user_id):
             msg += "\n\n👑 АДМИН: /admin — управление доступом"
-        kb = make_main_keyboard(self._get_session(user_id), is_admin=self._is_admin(user_id))
+        kb = make_main_keyboard(self._get_session(user_id), is_admin=self._is_admin(user_id),
+                                has_projects=bool(self._projects()))
         self.vk.send_message(peer_id, msg, keyboard=kb)
 
     def _cmd_menu(self, peer_id, user_id, args):
@@ -762,7 +768,8 @@ class VkTmuxBot:
                 keyboard=kb)
             return
         session = self._get_session(user_id)
-        kb = make_main_keyboard(session, is_admin=self._is_admin(user_id))
+        kb = make_main_keyboard(session, is_admin=self._is_admin(user_id),
+                                has_projects=bool(self._projects()))
         if session:
             text = f"⚡ Панель управления — сессия: «{session}»"
         else:
@@ -833,10 +840,11 @@ class VkTmuxBot:
 
         self._create_session(peer_id, user_id, name, command)
 
-    def _create_tmux(self, name):
-        """Создать tmux-сессию с настройками из конфига (узкая ширина под TUI)."""
+    def _create_tmux(self, name, work_dir=None):
+        """Создать tmux-сессию с настройками из конфига (узкая ширина под TUI).
+        work_dir переопределяет папку старта (напр. для проектов)."""
         t = self.config["tmux"]
-        return create_session(name, work_dir=t.get("work_dir"),
+        return create_session(name, work_dir=work_dir or t.get("work_dir"),
                               width=t.get("term_width"), height=t.get("term_height"))
 
     def _create_session(self, peer_id, user_id, name, command=None):
@@ -1182,16 +1190,16 @@ class VkTmuxBot:
         cmd = self.config.get("claude", {}).get("deepclaude_command", "dcc")
         self._launch_ai(peer_id, user_id, "dcc", cmd, "🧠 DeepClaude")
 
-    def _launch_ai(self, peer_id, user_id, session_name, command, label):
+    def _launch_ai(self, peer_id, user_id, session_name, command, label, work_dir=None):
         """Общий запуск AI-сессии: подключиться если есть, иначе создать+запустить.
-        В обоих случаях — сразу watch (живой вывод + детект простоя)."""
+        В обоих случаях — сразу watch (живой вывод + детект простоя).
+        work_dir — папка старта (для проектов)."""
         self.vk.set_typing(peer_id)  # «печатает» вместо текста-заглушки
         if session_exists(session_name):
             self._set_session(user_id, session_name)
             self._save_state()
         else:
-            work_dir = self.config["tmux"].get("work_dir", None)
-            if not self._create_tmux(session_name):
+            if not self._create_tmux(session_name, work_dir=work_dir):
                 self.vk.send_message(peer_id, "❌ Не удалось создать сессию.")
                 return
             self._set_session(user_id, session_name)
@@ -1206,6 +1214,94 @@ class VkTmuxBot:
             self._del_watch(user_id)
             self._watch_threads.pop(user_id, None)
         self._cmd_watch(peer_id, user_id, "")
+
+    # ── Мои проекты (конфиг-driven) ───────────────────────────
+    def _projects(self):
+        """Валидные проекты из конфига: [{name, path, session}, ...]."""
+        out = []
+        for p in (self.config.get("tmux", {}).get("projects") or []):
+            if not isinstance(p, dict):
+                continue
+            name = str(p.get("name") or "").strip()
+            path = str(p.get("path") or "").strip()
+            if not name or not path:
+                continue
+            sess = re.sub(r"[^a-zA-Z0-9_-]", "-", str(p.get("session") or name).strip())
+            out.append({"name": name, "path": path, "session": sess})
+        return out
+
+    def _cmd_projects(self, peer_id, user_id, args):
+        """Список проектов кнопками."""
+        projs = self._projects()
+        if not projs:
+            self.vk.send_message(
+                peer_id,
+                "📂 Мои проекты не настроены.\nДобавьте в конфиг секцию "
+                "tmux.projects (name + path).",
+                keyboard=make_keyboard([[{"label": "🏠 Меню", "color": "primary", "payload": "/menu"}]]))
+            return
+        rows, row = [], []
+        for i, p in enumerate(projs):
+            row.append({"label": f"📁 {p['name']}"[:40], "color": "primary", "payload": f"/proj {i}"})
+            if len(row) == 2:
+                rows.append(row); row = []
+        if row:
+            rows.append(row)
+        rows.append([{"label": "🏠 Меню", "color": "secondary", "payload": "/menu"}])
+        self.vk.send_message(peer_id, "📂 Мои проекты — выберите:",
+                             keyboard=make_keyboard(rows))
+
+    def _cmd_proj(self, peer_id, user_id, args):
+        """Экран проекта: кнопки Claude / DeepClaude / Терминал."""
+        projs = self._projects()
+        try:
+            idx = int((args or "").strip())
+        except ValueError:
+            idx = -1
+        if idx < 0 or idx >= len(projs):
+            self._cmd_projects(peer_id, user_id, "")
+            return
+        p = projs[idx]
+        running = " · ▶ запущена" if session_exists(p["session"]) else ""
+        kb = make_keyboard([
+            [{"label": "🤖 Claude", "color": "positive", "payload": f"/pj {idx} claude"},
+             {"label": "🧠 DeepClaude", "color": "positive", "payload": f"/pj {idx} dcc"}],
+            [{"label": "🖥 Терминал", "color": "secondary", "payload": f"/pj {idx} sh"}],
+            [{"label": "⬅ Проекты", "color": "secondary", "payload": "/projects"},
+             {"label": "🏠 Меню", "color": "primary", "payload": "/menu"}],
+        ])
+        self.vk.send_message(
+            peer_id, f"📁 {p['name']}{running}\n{p['path']}\n\nЧто запустить в этой папке?",
+            keyboard=kb)
+
+    def _cmd_pj(self, peer_id, user_id, args):
+        """Запуск в проекте: /pj <idx> <claude|dcc|sh>."""
+        parts = (args or "").split()
+        projs = self._projects()
+        try:
+            idx = int(parts[0]); kind = parts[1] if len(parts) > 1 else "sh"
+        except (ValueError, IndexError):
+            self._cmd_projects(peer_id, user_id, "")
+            return
+        if idx < 0 or idx >= len(projs):
+            self._cmd_projects(peer_id, user_id, "")
+            return
+        p = projs[idx]
+        if kind == "sh":
+            self.vk.set_typing(peer_id)
+            if not session_exists(p["session"]) and not self._create_tmux(p["session"], work_dir=p["path"]):
+                self.vk.send_message(peer_id, "❌ Не удалось создать сессию.")
+                return
+            self._set_session(user_id, p["session"])
+            self._save_state()
+            self._cmd_watch(peer_id, user_id, "")
+            return
+        claude_cfg = self.config.get("claude", {})
+        if kind == "dcc":
+            cmd = claude_cfg.get("deepclaude_command", "dcc"); label = "🧠 DeepClaude"
+        else:
+            cmd = claude_cfg.get("command", "claude"); label = "🤖 Claude Code"
+        self._launch_ai(peer_id, user_id, p["session"], cmd, label, work_dir=p["path"])
 
     def _cmd_notify(self, peer_id, user_id, args):
         """Вкл/выкл уведомления об ошибках."""

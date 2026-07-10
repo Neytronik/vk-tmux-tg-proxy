@@ -114,6 +114,9 @@ def create_session(session_name, work_dir=None, width=None, height=None):
         args += ["-y", str(height)]
     if work_dir:
         args += ["-c", work_dir]
+    # Отключаем авто-апдейт Claude Code в сессии: npm prefix обычно root-only,
+    # апдейт всё равно падает и сыплет предупреждением «no write permission».
+    args += ["-e", "CLAUDE_CODE_DISABLE_AUTO_UPDATE=1"]
     ok, _ = _tmux(*args)
     if not ok:
         return False
